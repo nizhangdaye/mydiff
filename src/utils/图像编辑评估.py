@@ -250,37 +250,39 @@ class BaseEvaluator(ABC):
                 original_prompts = batch["original_prompt"]
                 sample_ids = batch["sample_id"]
 
+                # 批量预处理图像
+                before_pils = [self._preprocess_image(img) for img in before_images]
+                after_pils = [
+                    self._preprocess_image(img) if img is not None else None
+                    for img in after_images
+                ]
+
+                # 批量生成编辑图像
+                with autocast_ctx:
+                    edited_images = self._generate_edited_image(
+                        before_pils, edit_prompts, sample_ids
+                    )
+
+                # 批量计算指标和保存结果
                 for i, (
-                    before_img,
-                    after_img,
+                    before_pil,
+                    after_pil,
+                    edited_image,
                     edit_prompt,
                     edited_prompt,
                     original_prompt,
                     sample_id,
                 ) in enumerate(
                     zip(
-                        before_images,
-                        after_images,
+                        before_pils,
+                        after_pils,
+                        edited_images,
                         edit_prompts,
                         edited_prompts,
                         original_prompts,
                         sample_ids,
                     )
                 ):
-                    # 预处理图像
-                    before_pil = self._preprocess_image(before_img)
-                    after_pil = (
-                        self._preprocess_image(after_img)
-                        if after_img is not None
-                        else None
-                    )
-
-                    # 生成编辑图像
-                    with autocast_ctx:
-                        edited_image = self._generate_edited_image(
-                            before_pil, edit_prompt, sample_id
-                        )
-
                     # 计算指标
                     metrics = self.compute_metrics(
                         before_pil, edited_image, after_pil, edit_prompt, edited_prompt
@@ -330,19 +332,24 @@ class BaseEvaluator(ABC):
             img = Image.fromarray(img)
         return img.convert("RGB").resize((self.args.resolution, self.args.resolution))
 
-    def _generate_edited_image(self, before_img, prompt, seed):
+    def _generate_edited_image(self, before_imgs, prompts, seeds):
         # 使用样本ID作为种子，确保可重现性
-        generator = torch.Generator(self.device).manual_seed(hash(str(seed)) % (2**32))
-        output = self.pipeline(
-            prompt,
-            image=before_img,
+        generators = [
+            torch.Generator(self.device).manual_seed(hash(str(seed)) % (2**32))
+            for seed in seeds
+        ]
+
+        # 使用批量推理
+        outputs = self.pipeline(
+            prompts,
+            image=before_imgs,
             num_inference_steps=self.args.num_inference_steps,
             image_guidance_scale=self.args.image_guidance_scale,
             guidance_scale=self.args.guidance_scale,
-            generator=generator,
-            output_type="pil",  # 默认就为 PIL
+            generator=generators,
+            output_type="pil",  # 默认输出为 PIL 图片
         )
-        return output.images[0]
+        return outputs.images
 
     def _log_results(self):
         logger.info("=== Evaluation Results ===")

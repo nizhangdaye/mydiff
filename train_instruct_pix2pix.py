@@ -58,6 +58,10 @@ from diffusers.utils.constants import DIFFUSERS_REQUEST_TIMEOUT
 from diffusers.utils.import_utils import is_xformers_available
 from diffusers.utils.torch_utils import is_compiled_module
 
+# Import custom dataset
+from src.data import ImageEditDataset
+from src.data.instruct_pix2pix_dataset import collate_fn
+
 if is_wandb_available():
     import wandb
 
@@ -82,15 +86,29 @@ def log_validation(pipeline, args, accelerator, generator, epoch, val_dataset):
         autocast_ctx = torch.autocast(accelerator.device.type)
 
     with autocast_ctx:
-        for idx, sample in enumerate(val_dataset):
-            # 使用测试集中的原始图像和编辑指令
-            before_image = sample["before"]
-            after_image = sample["after"]
-            edit_instruction = sample["edit"]
+        for idx in range(len(val_dataset)):
+            # 从 ImageEditDataset 获取原始数据
+            raw_sample = val_dataset.dataset[idx]
+
+            # 获取原始图像和目标图像
+            before_image = raw_sample["before"]
+            after_image = raw_sample["after"]
+
+            # 根据数据集配置获取编辑指令
+            if val_dataset.use_fixed_edit_text and val_dataset.fixed_edit_mapping:
+                # 使用固定编辑文本
+                edit_instruction = val_dataset.fixed_edit_mapping[
+                    raw_sample["disaster_type"]
+                ]
+            else:
+                # 使用数据集中的编辑指令
+                edit_instruction = raw_sample.get("edit", "edit image")
 
             # 确保图像格式正确
             if not isinstance(before_image, PIL.Image.Image):
                 before_image = PIL.Image.fromarray(before_image)
+            if not isinstance(after_image, PIL.Image.Image):
+                after_image = PIL.Image.fromarray(after_image)
 
             # 调整图像尺寸
             before_image = before_image.convert("RGB").resize(
@@ -413,6 +431,11 @@ def parse_args():
         action="store_true",
         help="Whether or not to use xformers.",
     )
+    parser.add_argument(
+        "--use_fixed_edit_text",
+        action="store_true",
+        help="Whether to use fixed edit text based on disaster type instead of dataset edit text.",
+    )
 
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
@@ -424,20 +447,6 @@ def parse_args():
         args.non_ema_revision = args.revision
 
     return args
-
-
-def convert_to_np(image, resolution):
-    image = image.convert("RGB").resize((resolution, resolution))
-    return np.array(image).transpose(2, 0, 1)
-
-
-def download_image(url):
-    image = PIL.Image.open(
-        requests.get(url, stream=True, timeout=DIFFUSERS_REQUEST_TIMEOUT).raw
-    )
-    image = PIL.ImageOps.exif_transpose(image)
-    image = image.convert("RGB")
-    return image
 
 
 def main():
@@ -651,108 +660,39 @@ def main():
         eps=args.adam_epsilon,
     )
 
-    # 固定加载本地数据集
-    logger.info("Loading dataset from /mnt/data/zwh/data/maxar/disaster_dataset")
-    dataset = load_from_disk("/mnt/data/zwh/data/maxar/disaster_dataset")
-
-    # Preprocessing the datasets.
-    # We need to tokenize input captions and transform the images.
-    def tokenize_captions(captions):
-        inputs = tokenizer(
-            captions,
-            max_length=tokenizer.model_max_length,
-            padding="max_length",
-            truncation=True,
-            return_tensors="pt",
-        )
-        return inputs.input_ids
-
-    # Preprocessing the datasets.
-    train_transforms = transforms.Compose(
-        [
-            transforms.CenterCrop(args.resolution)
-            if args.center_crop
-            else transforms.RandomCrop(args.resolution),
-            transforms.RandomHorizontalFlip()
-            if args.random_flip
-            else transforms.Lambda(lambda x: x),
-        ]
-    )
-
-    def preprocess_images(examples):
-        original_images = np.concatenate(
-            [convert_to_np(image, args.resolution) for image in examples["before"]]
-        )
-        edited_images = np.concatenate(
-            [convert_to_np(image, args.resolution) for image in examples["after"]]
-        )
-        # We need to ensure that the original and the edited images undergo the same
-        # augmentation transforms.
-        images = np.stack([original_images, edited_images])
-        images = torch.tensor(images)
-        images = 2 * (images / 255) - 1
-        return train_transforms(images)
-
-    def preprocess_train(examples):
-        # Preprocess images.
-        preprocessed_images = preprocess_images(examples)
-        # Since the original and edited images were concatenated before
-        # applying the transformations, we need to separate them and reshape
-        # them accordingly.
-        original_images, edited_images = preprocessed_images
-        original_images = original_images.reshape(
-            -1, 3, args.resolution, args.resolution
-        )
-        edited_images = edited_images.reshape(-1, 3, args.resolution, args.resolution)
-
-        # Collate the preprocessed images into the `examples`.
-        examples["original_pixel_values"] = original_images
-        examples["edited_pixel_values"] = edited_images
-
-        # Preprocess the captions.
-        captions = list(examples["edit"])
-        examples["input_ids"] = tokenize_captions(captions)
-        return examples
+    # Create dataset using the custom ImageEditDataset class
+    dataset_path = "/mnt/data/zwh/data/maxar/disaster_dataset"
 
     with accelerator.main_process_first():
-        if args.max_train_samples is not None:
-            dataset["train"] = (
-                dataset["train"]
-                .shuffle(seed=args.seed)
-                .select(range(args.max_train_samples))
-            )
-        # Set the training transforms
-        train_dataset = dataset["train"].with_transform(preprocess_train)
-
-        # 添加测试集，用于可视化处理
-        val_dataset = dataset["test"]
-        val_indices = random.sample(range(len(val_dataset)), 5)
-        val_dataset_fixed = val_dataset.select(val_indices)
-
-    def collate_fn(examples):
-        original_pixel_values = torch.stack(
-            [example["original_pixel_values"] for example in examples]
+        # Create training dataset
+        train_dataset = ImageEditDataset(
+            dataset_path=dataset_path,
+            tokenizer=tokenizer,
+            resolution=args.resolution,
+            split="train",
+            center_crop=args.center_crop,
+            random_flip=args.random_flip,
+            max_samples=args.max_train_samples,
+            seed=args.seed,
+            use_fixed_edit_text=args.use_fixed_edit_text,
         )
-        original_pixel_values = original_pixel_values.to(
-            memory_format=torch.contiguous_format
-        ).float()
-        edited_pixel_values = torch.stack(
-            [example["edited_pixel_values"] for example in examples]
+
+        # Create validation dataset for visualization
+        val_dataset_fixed = ImageEditDataset(
+            dataset_path=dataset_path,
+            tokenizer=tokenizer,
+            resolution=args.resolution,
+            split="test",
+            center_crop=False,
+            random_flip=False,
+            max_samples=10,  # 限制验证样本数量
+            seed=args.seed,
+            use_fixed_edit_text=args.use_fixed_edit_text,
         )
-        edited_pixel_values = edited_pixel_values.to(
-            memory_format=torch.contiguous_format
-        ).float()
-        input_ids = torch.stack([example["input_ids"] for example in examples])
-        return {
-            "original_pixel_values": original_pixel_values,
-            "edited_pixel_values": edited_pixel_values,
-            "input_ids": input_ids,
-        }
 
     # DataLoaders creation:
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
-        # torch.utils.data.Subset(train_dataset, range(10)),  # 用于调试
         shuffle=True,
         collate_fn=collate_fn,
         batch_size=args.train_batch_size,
@@ -941,8 +881,16 @@ def main():
                     prompt_mask = random_p < 2 * args.conditioning_dropout_prob
                     prompt_mask = prompt_mask.reshape(bsz, 1, 1)
                     # Final text conditioning.
+                    # Tokenize empty string for null conditioning
+                    null_inputs = tokenizer(
+                        [""],
+                        max_length=tokenizer.model_max_length,
+                        padding="max_length",
+                        truncation=True,
+                        return_tensors="pt",
+                    )
                     null_conditioning = text_encoder(
-                        tokenize_captions([""]).to(accelerator.device)
+                        null_inputs.input_ids.to(accelerator.device)
                     )[0]
                     encoder_hidden_states = torch.where(
                         prompt_mask, null_conditioning, encoder_hidden_states
