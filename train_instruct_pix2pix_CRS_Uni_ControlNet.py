@@ -907,6 +907,7 @@ def main(args):
     progress_bar.set_description("Steps")
 
     for epoch in range(first_epoch, args.num_train_epochs):
+        train_loss = 0.0
         for step, batch in enumerate(train_dataloader):
             # Skip steps until we reach the resumed step
             if (
@@ -1008,7 +1009,7 @@ def main(args):
 
                 # Gather the losses across all processes for logging (if we use distributed training).
                 avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
-                train_loss = avg_loss.item() / args.gradient_accumulation_steps
+                train_loss += avg_loss.item() / args.gradient_accumulation_steps
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
@@ -1066,6 +1067,7 @@ def main(args):
                 logs = {"step_loss": train_loss, "lr": lr_scheduler.get_last_lr()[0]}
                 accelerator.log({"train_loss": train_loss}, step=global_step)
                 progress_bar.set_postfix(**logs)
+                train_loss = 0.0
 
             if global_step >= args.max_train_steps:
                 break
