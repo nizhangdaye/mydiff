@@ -1,13 +1,22 @@
+import os
 from typing import Any, Callable, Dict, List, Optional, Union
 
 import torch
-
 from diffusers.callbacks import MultiPipelineCallbacks, PipelineCallback
 from diffusers.image_processor import PipelineImageInput, VaeImageProcessor
 from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_instruct_pix2pix import (
     StableDiffusionInstructPix2PixPipeline,
     StableDiffusionPipelineOutput,
 )
+from transformers import CLIPFeatureExtractor, CLIPTextModel, CLIPTokenizer
+
+from diffusers import (
+    AutoencoderKL,
+    DDPMScheduler,
+    UNet2DConditionModel,
+)
+
+from ..models.crs_diff_uni_controlnet.uni_controlnet import CRSDifUniControlNet
 
 
 class InstructPix2PixControlNetPipeline(StableDiffusionInstructPix2PixPipeline):
@@ -36,6 +45,7 @@ class InstructPix2PixControlNetPipeline(StableDiffusionInstructPix2PixPipeline):
             requires_safety_checker=requires_safety_checker,
         )
         self.controlnet = controlnet
+        self.register_modules(controlnet=controlnet)
 
     @torch.no_grad()
     def __call__(
@@ -192,3 +202,62 @@ class InstructPix2PixControlNetPipeline(StableDiffusionInstructPix2PixPipeline):
             return (image, None)
 
         return StableDiffusionPipelineOutput(images=image, nsfw_content_detected=None)
+
+    def save_pretrained(self, save_directory):
+        os.makedirs(save_directory, exist_ok=True)
+        # 保存基础组件
+        self.vae.save_pretrained(os.path.join(save_directory, "vae"))
+        self.text_encoder.save_pretrained(os.path.join(save_directory, "text_encoder"))
+        self.tokenizer.save_pretrained(os.path.join(save_directory, "tokenizer"))
+        self.unet.save_pretrained(os.path.join(save_directory, "unet"))
+        self.scheduler.save_pretrained(os.path.join(save_directory, "scheduler"))
+        self.controlnet.save_pretrained(os.path.join(save_directory, "controlnet"))
+        # 保存 feature_extractor（如果有）
+        if self.feature_extractor is not None:
+            self.feature_extractor.save_pretrained(
+                os.path.join(save_directory, "feature_extractor")
+            )
+        # 保存 model_index.json
+        self._save_config(save_directory)
+
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
+        # 加载各组件
+        vae = AutoencoderKL.from_pretrained(
+            os.path.join(pretrained_model_name_or_path, "vae")
+        )
+        text_encoder = CLIPTextModel.from_pretrained(
+            os.path.join(pretrained_model_name_or_path, "text_encoder")
+        )
+        tokenizer = CLIPTokenizer.from_pretrained(
+            os.path.join(pretrained_model_name_or_path, "tokenizer")
+        )
+        unet = UNet2DConditionModel.from_pretrained(
+            os.path.join(pretrained_model_name_or_path, "unet")
+        )
+        scheduler = DDPMScheduler.from_pretrained(
+            os.path.join(pretrained_model_name_or_path, "scheduler")
+        )
+        if os.path.exists(os.path.join(pretrained_model_name_or_path, "controlnet")):
+            controlnet = CRSDifUniControlNet.from_pretrained(
+                os.path.join(pretrained_model_name_or_path, "controlnet")
+            )
+        # 加载 feature_extractor（如果有）
+        feature_extractor = None
+        fe_dir = os.path.join(pretrained_model_name_or_path, "feature_extractor")
+        if os.path.exists(fe_dir):
+            feature_extractor = CLIPFeatureExtractor.from_pretrained(fe_dir)
+        # 其他参数
+        kwargs.setdefault("safety_checker", None)
+        kwargs.setdefault("feature_extractor", feature_extractor)
+        kwargs.setdefault("image_encoder", None)
+        kwargs.setdefault("requires_safety_checker", False)
+        return cls(
+            vae=vae,
+            text_encoder=text_encoder,
+            tokenizer=tokenizer,
+            unet=unet,
+            scheduler=scheduler,
+            controlnet=controlnet,
+            **kwargs,
+        )

@@ -3,12 +3,11 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
-from torch.nn import functional as F
-
 from diffusers.configuration_utils import register_to_config
 from diffusers.models.attention_processor import Attention, AttentionProcessor
 from diffusers.models.controlnets.controlnet import ControlNetModel, ControlNetOutput
 from diffusers.models.embeddings import TimestepEmbedding
+from torch.nn import functional as F
 
 from ..sat_unet import SatelliteUNet2DConditionModel
 from .uni_control_local_adapter import (

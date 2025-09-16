@@ -34,6 +34,11 @@ from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
 from datasets import load_dataset, load_from_disk
+from diffusers.optimization import get_scheduler
+from diffusers.training_utils import EMAModel
+from diffusers.utils.hub_utils import load_or_create_model_card, populate_model_card
+from diffusers.utils.import_utils import is_xformers_available
+from diffusers.utils.torch_utils import is_compiled_module
 from huggingface_hub import create_repo, upload_folder
 from packaging import version
 from PIL import Image
@@ -48,12 +53,7 @@ from diffusers import (
     UNet2DConditionModel,
     UniPCMultistepScheduler,
 )
-from diffusers.optimization import get_scheduler
-from diffusers.training_utils import EMAModel
 from diffusers.utils import check_min_version, is_wandb_available
-from diffusers.utils.hub_utils import load_or_create_model_card, populate_model_card
-from diffusers.utils.import_utils import is_xformers_available
-from diffusers.utils.torch_utils import is_compiled_module
 from src.data.instruct_pix2pix_dataset import ImageEditDataset, collate_fn
 from src.models.crs_diff_uni_controlnet.uni_controlnet import CRSDifUniControlNet
 from src.pipeline.instructP2PControlNetPipeline import InstructPix2PixControlNetPipeline
@@ -1065,7 +1065,7 @@ def main(args):
                         logger.info(f"Saved state to {save_path}")
 
                 logs = {"step_loss": train_loss, "lr": lr_scheduler.get_last_lr()[0]}
-                accelerator.log({"train_loss": train_loss}, step=global_step)
+                accelerator.log(logs, step=global_step)
                 progress_bar.set_postfix(**logs)
                 train_loss = 0.0
 
