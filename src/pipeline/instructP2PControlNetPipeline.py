@@ -31,7 +31,7 @@ class InstructPix2PixControlNetPipeline(StableDiffusionInstructPix2PixPipeline):
         feature_extractor=None,
         image_encoder=None,
         controlnet=None,
-        requires_safety_checker: bool = True,
+        requires_safety_checker: bool = False,
     ):
         super().__init__(
             vae=vae,
@@ -218,46 +218,4 @@ class InstructPix2PixControlNetPipeline(StableDiffusionInstructPix2PixPipeline):
                 os.path.join(save_directory, "feature_extractor")
             )
         # 保存 model_index.json
-        self._save_config(save_directory)
-
-    @classmethod
-    def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
-        # 加载各组件
-        vae = AutoencoderKL.from_pretrained(
-            os.path.join(pretrained_model_name_or_path, "vae")
-        )
-        text_encoder = CLIPTextModel.from_pretrained(
-            os.path.join(pretrained_model_name_or_path, "text_encoder")
-        )
-        tokenizer = CLIPTokenizer.from_pretrained(
-            os.path.join(pretrained_model_name_or_path, "tokenizer")
-        )
-        unet = UNet2DConditionModel.from_pretrained(
-            os.path.join(pretrained_model_name_or_path, "unet")
-        )
-        scheduler = DDPMScheduler.from_pretrained(
-            os.path.join(pretrained_model_name_or_path, "scheduler")
-        )
-        if os.path.exists(os.path.join(pretrained_model_name_or_path, "controlnet")):
-            controlnet = CRSDifUniControlNet.from_pretrained(
-                os.path.join(pretrained_model_name_or_path, "controlnet")
-            )
-        # 加载 feature_extractor（如果有）
-        feature_extractor = None
-        fe_dir = os.path.join(pretrained_model_name_or_path, "feature_extractor")
-        if os.path.exists(fe_dir):
-            feature_extractor = CLIPFeatureExtractor.from_pretrained(fe_dir)
-        # 其他参数
-        kwargs.setdefault("safety_checker", None)
-        kwargs.setdefault("feature_extractor", feature_extractor)
-        kwargs.setdefault("image_encoder", None)
-        kwargs.setdefault("requires_safety_checker", False)
-        return cls(
-            vae=vae,
-            text_encoder=text_encoder,
-            tokenizer=tokenizer,
-            unet=unet,
-            scheduler=scheduler,
-            controlnet=controlnet,
-            **kwargs,
-        )
+        self.save_config(save_directory)
