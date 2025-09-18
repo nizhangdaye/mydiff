@@ -39,6 +39,11 @@ from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
 from datasets import load_from_disk
+from diffusers.optimization import get_scheduler
+from diffusers.training_utils import EMAModel
+from diffusers.utils.constants import DIFFUSERS_REQUEST_TIMEOUT
+from diffusers.utils.import_utils import is_xformers_available
+from diffusers.utils.torch_utils import is_compiled_module
 from packaging import version
 from torchvision import transforms
 from tqdm.auto import tqdm
@@ -51,12 +56,7 @@ from diffusers import (
     StableDiffusionInstructPix2PixPipeline,
     UNet2DConditionModel,
 )
-from diffusers.optimization import get_scheduler
-from diffusers.training_utils import EMAModel
 from diffusers.utils import check_min_version, deprecate, is_wandb_available
-from diffusers.utils.constants import DIFFUSERS_REQUEST_TIMEOUT
-from diffusers.utils.import_utils import is_xformers_available
-from diffusers.utils.torch_utils import is_compiled_module
 
 # Import custom dataset
 from src.data import ImageEditDataset
@@ -97,9 +97,7 @@ def log_validation(pipeline, args, accelerator, generator, epoch, val_dataset):
             # 根据数据集配置获取编辑指令
             if val_dataset.use_fixed_edit_text and val_dataset.fixed_edit_mapping:
                 # 使用固定编辑文本
-                edit_instruction = val_dataset.fixed_edit_mapping[
-                    raw_sample["disaster_type"]
-                ]
+                edit_instruction = val_dataset.fixed_edit_mapping[raw_sample["disaster_type"]]
             else:
                 # 使用数据集中的编辑指令
                 edit_instruction = raw_sample.get("edit", "edit image")
@@ -111,9 +109,7 @@ def log_validation(pipeline, args, accelerator, generator, epoch, val_dataset):
                 after_image = PIL.Image.fromarray(after_image)
 
             # 调整图像尺寸
-            before_image = before_image.convert("RGB").resize(
-                (args.resolution, args.resolution)
-            )
+            before_image = before_image.convert("RGB").resize((args.resolution, args.resolution))
 
             edited_image = pipeline(
                 edit_instruction,
@@ -157,22 +153,14 @@ def log_validation(pipeline, args, accelerator, generator, epoch, val_dataset):
                 after_np = np.array(result["after"]).transpose(2, 0, 1)
 
                 if epoch < 1:
-                    tracker.writer.add_image(
-                        f"validation/sample_{idx}_after", after_np, epoch
-                    )
-                    tracker.writer.add_image(
-                        f"validation/sample_{idx}_edited", edited_np, epoch
-                    )
-                    tracker.writer.add_image(
-                        f"validation/sample_{idx}_before", before_np, epoch
-                    )
+                    tracker.writer.add_image(f"validation/sample_{idx}_after", after_np, epoch)
+                    tracker.writer.add_image(f"validation/sample_{idx}_edited", edited_np, epoch)
+                    tracker.writer.add_image(f"validation/sample_{idx}_before", before_np, epoch)
                     tracker.writer.add_text(
                         f"validation/sample_{idx}_prompt", result["prompt"], epoch
                     )
                 else:
-                    tracker.writer.add_image(
-                        f"validation/sample_{idx}_edited", edited_np, epoch
-                    )
+                    tracker.writer.add_image(f"validation/sample_{idx}_edited", edited_np, epoch)
 
 
 def parse_args():
@@ -216,8 +204,7 @@ def parse_args():
         type=int,
         default=None,
         help=(
-            "For debugging purposes or quicker training, truncate the number of training examples to this "
-            "value if set."
+            "For debugging purposes or quicker training, truncate the number of training examples to this value if set."
         ),
     )
     parser.add_argument(
@@ -226,9 +213,7 @@ def parse_args():
         default="instruct-pix2pix-model",
         help="The output directory where the model predictions and checkpoints will be written.",
     )
-    parser.add_argument(
-        "--seed", type=int, default=None, help="A seed for reproducible training."
-    )
+    parser.add_argument("--seed", type=int, default=None, help="A seed for reproducible training.")
     parser.add_argument(
         "--resolution",
         type=int,
@@ -322,9 +307,7 @@ def parse_args():
             " https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices"
         ),
     )
-    parser.add_argument(
-        "--use_ema", action="store_true", help="Whether to use EMA model."
-    )
+    parser.add_argument("--use_ema", action="store_true", help="Whether to use EMA model.")
     parser.add_argument(
         "--non_ema_revision",
         type=str,
@@ -364,9 +347,7 @@ def parse_args():
         default=1e-08,
         help="Epsilon value for the Adam optimizer",
     )
-    parser.add_argument(
-        "--max_grad_norm", default=1.0, type=float, help="Max gradient norm."
-    )
+    parser.add_argument("--max_grad_norm", default=1.0, type=float, help="Max gradient norm.")
     parser.add_argument(
         "--logging_dir",
         type=str,
@@ -574,9 +555,7 @@ def main():
                 )
             unet.enable_xformers_memory_efficient_attention()
         else:
-            raise ValueError(
-                "xformers is not available. Make sure it is installed correctly"
-            )
+            raise ValueError("xformers is not available. Make sure it is installed correctly")
 
     def unwrap_model(model):
         model = accelerator.unwrap_model(model)
@@ -612,9 +591,7 @@ def main():
                 model = models.pop()
 
                 # load diffusers style into model
-                load_model = UNet2DConditionModel.from_pretrained(
-                    input_dir, subfolder="unet"
-                )
+                load_model = UNet2DConditionModel.from_pretrained(input_dir, subfolder="unet")
                 model.register_to_config(**load_model.config)
 
                 model.load_state_dict(load_model.state_dict())
@@ -710,14 +687,10 @@ def main():
             len_train_dataloader_after_sharding / args.gradient_accumulation_steps
         )
         num_training_steps_for_scheduler = (
-            args.num_train_epochs
-            * num_update_steps_per_epoch
-            * accelerator.num_processes
+            args.num_train_epochs * num_update_steps_per_epoch * accelerator.num_processes
         )
     else:
-        num_training_steps_for_scheduler = (
-            args.max_train_steps * accelerator.num_processes
-        )
+        num_training_steps_for_scheduler = args.max_train_steps * accelerator.num_processes
 
     lr_scheduler = get_scheduler(
         args.lr_scheduler,
@@ -747,15 +720,10 @@ def main():
     vae.to(accelerator.device, dtype=weight_dtype)
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
-    num_update_steps_per_epoch = math.ceil(
-        len(train_dataloader) / args.gradient_accumulation_steps
-    )
+    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     if args.max_train_steps is None:
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
-        if (
-            num_training_steps_for_scheduler
-            != args.max_train_steps * accelerator.num_processes
-        ):
+        if num_training_steps_for_scheduler != args.max_train_steps * accelerator.num_processes:
             logger.warning(
                 f"The length of the 'train_dataloader' after 'accelerator.prepare' ({len(train_dataloader)}) does not match "
                 f"the expected length ({len_train_dataloader_after_sharding}) when the learning rate scheduler was created. "
@@ -771,9 +739,7 @@ def main():
 
     # Train!
     total_batch_size = (
-        args.train_batch_size
-        * accelerator.num_processes
-        * args.gradient_accumulation_steps
+        args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
     )
 
     logger.info("***** Running training *****")
@@ -828,11 +794,7 @@ def main():
         train_loss = 0.0
         for step, batch in enumerate(train_dataloader):
             # Skip steps until we reach the resumed step
-            if (
-                args.resume_from_checkpoint
-                and epoch == first_epoch
-                and step < resume_step
-            ):
+            if args.resume_from_checkpoint and epoch == first_epoch and step < resume_step:
                 if step % args.gradient_accumulation_steps == 0:
                     progress_bar.update(1)
                 continue
@@ -874,9 +836,7 @@ def main():
                 # Conditioning dropout to support classifier-free guidance during inference. For more details
                 # check out the section 3.2.1 of the original paper https://huggingface.co/papers/2211.09800.
                 if args.conditioning_dropout_prob is not None:
-                    random_p = torch.rand(
-                        bsz, device=latents.device, generator=generator
-                    )
+                    random_p = torch.rand(bsz, device=latents.device, generator=generator)
                     # Sample masks for the edit prompts.
                     prompt_mask = random_p < 2 * args.conditioning_dropout_prob
                     prompt_mask = prompt_mask.reshape(bsz, 1, 1)
@@ -889,9 +849,9 @@ def main():
                         truncation=True,
                         return_tensors="pt",
                     )
-                    null_conditioning = text_encoder(
-                        null_inputs.input_ids.to(accelerator.device)
-                    )[0]
+                    null_conditioning = text_encoder(null_inputs.input_ids.to(accelerator.device))[
+                        0
+                    ]
                     encoder_hidden_states = torch.where(
                         prompt_mask, null_conditioning, encoder_hidden_states
                     )
@@ -899,12 +859,8 @@ def main():
                     # Sample masks for the original images.
                     image_mask_dtype = original_image_embeds.dtype
                     image_mask = 1 - (
-                        (random_p >= args.conditioning_dropout_prob).to(
-                            image_mask_dtype
-                        )
-                        * (random_p < 3 * args.conditioning_dropout_prob).to(
-                            image_mask_dtype
-                        )
+                        (random_p >= args.conditioning_dropout_prob).to(image_mask_dtype)
+                        * (random_p < 3 * args.conditioning_dropout_prob).to(image_mask_dtype)
                     )
                     image_mask = image_mask.reshape(bsz, 1, 1, 1)
                     # Final image conditioning.
@@ -958,18 +914,12 @@ def main():
                         # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
                         if args.checkpoints_total_limit is not None:
                             checkpoints = os.listdir(args.output_dir)
-                            checkpoints = [
-                                d for d in checkpoints if d.startswith("checkpoint")
-                            ]
-                            checkpoints = sorted(
-                                checkpoints, key=lambda x: int(x.split("-")[1])
-                            )
+                            checkpoints = [d for d in checkpoints if d.startswith("checkpoint")]
+                            checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))
 
                             # before we save the new checkpoint, we need to have at _most_ `checkpoints_total_limit - 1` checkpoints
                             if len(checkpoints) >= args.checkpoints_total_limit:
-                                num_to_remove = (
-                                    len(checkpoints) - args.checkpoints_total_limit + 1
-                                )
+                                num_to_remove = len(checkpoints) - args.checkpoints_total_limit + 1
                                 removing_checkpoints = checkpoints[0:num_to_remove]
 
                                 logger.info(
@@ -985,9 +935,7 @@ def main():
                                     )
                                     shutil.rmtree(removing_checkpoint)
 
-                        save_path = os.path.join(
-                            args.output_dir, f"checkpoint-{global_step}"
-                        )
+                        save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
 
@@ -1016,9 +964,7 @@ def main():
                     torch_dtype=weight_dtype,
                 )
 
-                log_validation(
-                    pipeline, args, accelerator, generator, epoch, val_dataset_fixed
-                )
+                log_validation(pipeline, args, accelerator, generator, epoch, val_dataset_fixed)
 
                 if args.use_ema:
                     # Switch back to the original UNet parameters.
