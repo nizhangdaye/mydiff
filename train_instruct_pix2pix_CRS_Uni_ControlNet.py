@@ -110,9 +110,7 @@ def log_validation(pipeline, args, accelerator, generator, epoch, val_dataset):
             # 根据数据集配置获取编辑指令
             if val_dataset.use_fixed_edit_text and val_dataset.fixed_edit_mapping:
                 # 使用固定编辑文本
-                edit_instruction = val_dataset.fixed_edit_mapping[
-                    raw_sample["disaster_type"]
-                ]
+                edit_instruction = val_dataset.fixed_edit_mapping[raw_sample["disaster_type"]]
             else:
                 # 使用数据集中的编辑指令
                 edit_instruction = raw_sample["edit"]
@@ -129,18 +127,14 @@ def log_validation(pipeline, args, accelerator, generator, epoch, val_dataset):
 
             # 调整图像尺寸
             before_image = before_image.resize((args.resolution, args.resolution))
-            before_depth = before_depth.resize(
-                (args.resolution, args.resolution)
-            ).convert("RGB")
-            before_seg = before_seg.resize((args.resolution, args.resolution))
+            before_depth_img = before_depth.resize((args.resolution, args.resolution)).convert("RGB")
+            before_seg_img = before_seg.resize((args.resolution, args.resolution))
+            after_image = after_image.resize((args.resolution, args.resolution))
 
-            # 将条件图像在通道上拼接
-            before_depth = transforms.ToTensor()(before_depth)
-            before_seg = transforms.ToTensor()(before_seg)
-            conditioning_image = torch.cat(
-                [before_depth, before_seg], dim=0
-            )  # [6, H, W]
-            conditioning_image = conditioning_image.unsqueeze(0)  # [1, 6, H, W]
+            # 拼接条件图像
+            before_depth_tensor = transforms.ToTensor()(before_depth_img)
+            before_seg_tensor = transforms.ToTensor()(before_seg_img)
+            conditioning_image = torch.cat([before_depth_tensor, before_seg_tensor], dim=0).unsqueeze(0)  # [1, 6, H, W]
 
             edited_image = pipeline(
                 prompt=edit_instruction,
@@ -150,85 +144,47 @@ def log_validation(pipeline, args, accelerator, generator, epoch, val_dataset):
                 generator=generator,
             ).images[0]
 
+            # 生成两行三列的可视化图像
+            # 第一行：灾前图像、灾后图像、深度图
+            # 第二行：语义图、编辑后图像、空白
+            vis_width, vis_height = args.resolution, args.resolution
+            grid_img = Image.new("RGB", (vis_width * 3, vis_height * 2), (255, 255, 255))
+            # 灾前
+            grid_img.paste(before_image, (0, 0))
+            # 灾后
+            grid_img.paste(after_image, (vis_width, 0))
+            # 深度
+            grid_img.paste(before_depth_img, (vis_width * 2, 0))
+            # 语义
+            grid_img.paste(before_seg_img.convert("RGB"), (0, vis_height))
+            # 编辑后
+            grid_img.paste(edited_image, (vis_width, vis_height))
+            # 空白(右下角)已为白色，无需处理
+
             validation_results.append(
                 {
-                    "before": before_image,
-                    "after": after_image,
-                    "edited": edited_image,
-                    "prompt": edit_instruction,
-                    "before_depth": before_depth,
-                    "before_seg": before_seg,
                     "sample_idx": idx,
+                    "vis_image": grid_img,
+                    "prompt": edit_instruction,
                 }
             )
 
     for tracker in accelerator.trackers:
         if tracker.name == "wandb":
-            wandb_table = wandb.Table(
-                columns=["sample_idx", "before", "edited_image", "after", "edit_prompt"]
-            )
+            wandb_table = wandb.Table(columns=["sample_idx", "visualization", "edit_prompt"])
             for result in validation_results:
                 wandb_table.add_data(
                     result["sample_idx"],
-                    wandb.Image(result["before"]),
-                    wandb.Image(result["edited"]),
-                    wandb.Image(result["after"]),
+                    wandb.Image(result["vis_image"]),
                     result["prompt"],
                 )
             tracker.log({f"validation_epoch_{epoch}": wandb_table})
         elif tracker.name == "tensorboard":
             for result in validation_results:
                 idx = result["sample_idx"]
-                # 转换PIL图像为numpy数组
-                before_np = np.array(result["before"]).transpose(2, 0, 1)
-                edited_np = np.array(result["edited"]).transpose(2, 0, 1)
-                after_np = np.array(result["after"]).transpose(2, 0, 1)
-                before_depth = np.array(result["before_depth"])
-                before_seg = np.array(result["before_seg"])
-
-                # squeeze 掉 batch 维度
-                if before_depth.ndim == 3 and before_depth.shape[0] == 1:
-                    before_depth = before_depth.squeeze(0)
-                if before_seg.ndim == 3 and before_seg.shape[0] == 1:
-                    before_seg = before_seg.squeeze(0)
-
-                # 如果是灰度图，扩展为3通道
-                if before_depth.ndim == 2:
-                    before_depth = np.stack([before_depth] * 3, axis=0)
-                elif before_depth.shape[0] == 1:
-                    before_depth = np.repeat(before_depth, 3, axis=0)
-                if before_seg.ndim == 2:
-                    before_seg = np.stack([before_seg] * 3, axis=0)
-                elif before_seg.shape[0] == 1:
-                    before_seg = np.repeat(before_seg, 3, axis=0)
-
-                # 转换为 float32
-                before_depth = before_depth.astype(np.float32)
-                before_seg = before_seg.astype(np.float32)
-
-                if epoch < 1:
-                    tracker.writer.add_image(
-                        f"validation/sample_{idx}_after", after_np, epoch
-                    )
-                    tracker.writer.add_image(
-                        f"validation/sample_{idx}_edited", edited_np, epoch
-                    )
-                    tracker.writer.add_image(
-                        f"validation/sample_{idx}_before", before_np, epoch
-                    )
-                    tracker.writer.add_image(
-                        f"validation/sample_{idx}_depth", before_depth, epoch
-                    )
-                    tracker.writer.add_image(
-                        f"validation/sample_{idx}_seg", before_seg, epoch
-                    )
-                    tracker.writer.add_text(
-                        f"validation/sample_{idx}_prompt", result["prompt"], epoch
-                    )
-                else:
-                    tracker.writer.add_image(
-                        f"validation/sample_{idx}_edited", edited_np, epoch
-                    )
+                vis_np = np.array(result["vis_image"]).transpose(2, 0, 1)
+                tracker.writer.add_image(f"validation/sample_{idx}_visualization", vis_np, epoch)
+                tracker.writer.add_text(f"validation/sample_{idx}_prompt", result["prompt"], epoch)
 
 
 def parse_args():
@@ -272,8 +228,7 @@ def parse_args():
         type=int,
         default=None,
         help=(
-            "For debugging purposes or quicker training, truncate the number of training examples to this "
-            "value if set."
+            "For debugging purposes or quicker training, truncate the number of training examples to this value if set."
         ),
     )
     parser.add_argument(
@@ -282,9 +237,7 @@ def parse_args():
         default="instruct-pix2pix-model",
         help="The output directory where the model predictions and checkpoints will be written.",
     )
-    parser.add_argument(
-        "--seed", type=int, default=None, help="A seed for reproducible training."
-    )
+    parser.add_argument("--seed", type=int, default=None, help="A seed for reproducible training.")
     parser.add_argument(
         "--resolution",
         type=int,
@@ -302,11 +255,6 @@ def parse_args():
             "Whether to center crop the input images to the resolution. If not set, the images will be randomly"
             " cropped. The images will be resized to the resolution first before cropping."
         ),
-    )
-    parser.add_argument(
-        "--random_flip",
-        action="store_true",
-        help="whether to randomly flip images horizontally",
     )
     parser.add_argument(
         "--train_batch_size",
@@ -391,9 +339,7 @@ def parse_args():
             " https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices"
         ),
     )
-    parser.add_argument(
-        "--use_ema", action="store_true", help="Whether to use EMA model."
-    )
+    parser.add_argument("--use_ema", action="store_true", help="Whether to use EMA model.")
     parser.add_argument(
         "--non_ema_revision",
         type=str,
@@ -424,18 +370,14 @@ def parse_args():
         default=0.999,
         help="The beta2 parameter for the Adam optimizer.",
     )
-    parser.add_argument(
-        "--adam_weight_decay", type=float, default=1e-2, help="Weight decay to use."
-    )
+    parser.add_argument("--adam_weight_decay", type=float, default=1e-2, help="Weight decay to use.")
     parser.add_argument(
         "--adam_epsilon",
         type=float,
         default=1e-08,
         help="Epsilon value for the Adam optimizer",
     )
-    parser.add_argument(
-        "--max_grad_norm", default=1.0, type=float, help="Max gradient norm."
-    )
+    parser.add_argument("--max_grad_norm", default=1.0, type=float, help="Max gradient norm.")
     parser.add_argument(
         "--logging_dir",
         type=str,
@@ -527,9 +469,7 @@ def main(args):
 
     logging_dir = Path(args.output_dir, args.logging_dir)
 
-    accelerator_project_config = ProjectConfiguration(
-        project_dir=args.output_dir, logging_dir=logging_dir
-    )
+    accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
 
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -576,9 +516,7 @@ def main(args):
     )
 
     # Load scheduler and models
-    noise_scheduler = DDPMScheduler.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="scheduler"
-    )
+    noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
     text_encoder = CLIPTextModel.from_pretrained(
         args.pretrained_model_name_or_path,
         subfolder="text_encoder",
@@ -620,9 +558,7 @@ def main(args):
         def save_model_hook(models, weights, output_dir):
             if accelerator.is_main_process:
                 if args.use_ema:
-                    ema_ControlNet.save_pretrained(
-                        os.path.join(output_dir, "ControlNet_ema")
-                    )
+                    ema_ControlNet.save_pretrained(os.path.join(output_dir, "ControlNet_ema"))
 
                 i = len(weights) - 1
 
@@ -637,9 +573,7 @@ def main(args):
 
         def load_model_hook(models, input_dir):
             if args.use_ema:
-                load_model = EMAModel.from_pretrained(
-                    os.path.join(input_dir, "ControlNet_ema"), CRSDifUniControlNet
-                )
+                load_model = EMAModel.from_pretrained(os.path.join(input_dir, "ControlNet_ema"), CRSDifUniControlNet)
                 ema_ControlNet.load_state_dict(load_model.state_dict())
                 ema_ControlNet.to(accelerator.device)
                 del load_model
@@ -649,9 +583,7 @@ def main(args):
                 model = models.pop()
 
                 # load diffusers style into model
-                load_model = CRSDifUniControlNet.from_pretrained(
-                    input_dir, subfolder="controlnet"
-                )
+                load_model = CRSDifUniControlNet.from_pretrained(input_dir, subfolder="controlnet")
                 model.register_to_config(**load_model.config)
 
                 model.load_state_dict(load_model.state_dict())
@@ -684,9 +616,7 @@ def main(args):
             unet.enable_xformers_memory_efficient_attention()
             controlnet.enable_xformers_memory_efficient_attention()
         else:
-            raise ValueError(
-                "xformers is not available. Make sure it is installed correctly"
-            )
+            raise ValueError("xformers is not available. Make sure it is installed correctly")
 
     if args.gradient_checkpointing:
         controlnet.enable_gradient_checkpointing()
@@ -709,10 +639,7 @@ def main(args):
 
     if args.scale_lr:
         args.learning_rate = (
-            args.learning_rate
-            * args.gradient_accumulation_steps
-            * args.train_batch_size
-            * accelerator.num_processes
+            args.learning_rate * args.gradient_accumulation_steps * args.train_batch_size * accelerator.num_processes
         )
 
     # Use 8-bit Adam for lower memory usage or to fine-tune the model in 16GB GPUs
@@ -720,9 +647,7 @@ def main(args):
         try:
             import bitsandbytes as bnb
         except ImportError:
-            raise ImportError(
-                "To use 8-bit Adam, please install the bitsandbytes library: `pip install bitsandbytes`."
-            )
+            raise ImportError("To use 8-bit Adam, please install the bitsandbytes library: `pip install bitsandbytes`.")
 
         optimizer_class = bnb.optim.AdamW8bit
     else:
@@ -748,9 +673,8 @@ def main(args):
             resolution=args.resolution,
             split="train",
             center_crop=args.center_crop,
-            random_flip=args.random_flip,
-            max_samples=args.max_train_samples,
-            # max_samples=10,
+            # max_samples=args.max_train_samples,
+            max_samples=10,
             seed=args.seed,
             use_fixed_edit_text=args.use_fixed_edit_text,
         )
@@ -762,7 +686,6 @@ def main(args):
             resolution=args.resolution,
             split="test",
             center_crop=False,
-            random_flip=False,
             max_samples=10,  # 限制验证样本数量
             seed=args.seed,
             use_fixed_edit_text=args.use_fixed_edit_text,
@@ -780,21 +703,13 @@ def main(args):
     # Check the PR https://github.com/huggingface/diffusers/pull/8312 for detailed explanation.
     num_warmup_steps_for_scheduler = args.lr_warmup_steps * accelerator.num_processes
     if args.max_train_steps is None:
-        len_train_dataloader_after_sharding = math.ceil(
-            len(train_dataloader) / accelerator.num_processes
-        )
-        num_update_steps_per_epoch = math.ceil(
-            len_train_dataloader_after_sharding / args.gradient_accumulation_steps
-        )
+        len_train_dataloader_after_sharding = math.ceil(len(train_dataloader) / accelerator.num_processes)
+        num_update_steps_per_epoch = math.ceil(len_train_dataloader_after_sharding / args.gradient_accumulation_steps)
         num_training_steps_for_scheduler = (
-            args.num_train_epochs
-            * num_update_steps_per_epoch
-            * accelerator.num_processes
+            args.num_train_epochs * num_update_steps_per_epoch * accelerator.num_processes
         )
     else:
-        num_training_steps_for_scheduler = (
-            args.max_train_steps * accelerator.num_processes
-        )
+        num_training_steps_for_scheduler = args.max_train_steps * accelerator.num_processes
 
     lr_scheduler = get_scheduler(
         args.lr_scheduler,
@@ -827,15 +742,10 @@ def main(args):
     text_encoder.to(accelerator.device, dtype=weight_dtype)
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
-    num_update_steps_per_epoch = math.ceil(
-        len(train_dataloader) / args.gradient_accumulation_steps
-    )
+    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     if args.max_train_steps is None:
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
-        if (
-            num_training_steps_for_scheduler
-            != args.max_train_steps * accelerator.num_processes
-        ):
+        if num_training_steps_for_scheduler != args.max_train_steps * accelerator.num_processes:
             logger.warning(
                 f"The length of the 'train_dataloader' after 'accelerator.prepare' ({len(train_dataloader)}) does not match "
                 f"the expected length ({len_train_dataloader_after_sharding}) when the learning rate scheduler was created. "
@@ -847,25 +757,17 @@ def main(args):
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
     if accelerator.is_main_process:
-        accelerator.init_trackers(
-            "instruct-pix2pix-CRS-Uni_ControlNet", config=vars(args)
-        )
+        accelerator.init_trackers("instruct-pix2pix-CRS-Uni_ControlNet", config=vars(args))
 
     # Train!
-    total_batch_size = (
-        args.train_batch_size
-        * accelerator.num_processes
-        * args.gradient_accumulation_steps
-    )
+    total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
 
     logger.info("***** Running training *****")
     logger.info(f"  Num examples = {len(train_dataset)}")
     logger.info(f"  Num batches each epoch = {len(train_dataloader)}")
     logger.info(f"  Num Epochs = {args.num_train_epochs}")
     logger.info(f"  Instantaneous batch size per device = {args.train_batch_size}")
-    logger.info(
-        f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}"
-    )
+    logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
     logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
     global_step = 0
@@ -894,9 +796,7 @@ def main(args):
 
             resume_global_step = global_step * args.gradient_accumulation_steps
             first_epoch = global_step // num_update_steps_per_epoch
-            resume_step = resume_global_step % (
-                num_update_steps_per_epoch * args.gradient_accumulation_steps
-            )
+            resume_step = resume_global_step % (num_update_steps_per_epoch * args.gradient_accumulation_steps)
 
     # Only show the progress bar once on each machine.
     progress_bar = tqdm(
@@ -910,20 +810,14 @@ def main(args):
         train_loss = 0.0
         for step, batch in enumerate(train_dataloader):
             # Skip steps until we reach the resumed step
-            if (
-                args.resume_from_checkpoint
-                and epoch == first_epoch
-                and step < resume_step
-            ):
+            if args.resume_from_checkpoint and epoch == first_epoch and step < resume_step:
                 if step % args.gradient_accumulation_steps == 0:
                     progress_bar.update(1)
                 continue
 
             with accelerator.accumulate(controlnet):
                 # Convert images to latent space
-                latents = vae.encode(
-                    batch["edited_pixel_values"].to(dtype=weight_dtype)
-                ).latent_dist.sample()
+                latents = vae.encode(batch["edited_pixel_values"].to(dtype=weight_dtype)).latent_dist.sample()
                 latents = latents * vae.config.scaling_factor
 
                 # Sample noise that we'll add to the latents
@@ -940,33 +834,23 @@ def main(args):
 
                 # Add noise to the latents according to the noise magnitude at each timestep
                 # (this is the forward diffusion process)
-                noisy_latents = noise_scheduler.add_noise(
-                    latents.float(), noise.float(), timesteps
-                ).to(dtype=weight_dtype)
-
-                # Get the text embedding for conditioning
-                encoder_hidden_states = text_encoder(
-                    batch["input_ids"], return_dict=False
-                )[0]
-
-                original_image_embeds = vae.encode(
-                    batch["original_pixel_values"].to(weight_dtype)
-                ).latent_dist.mode()
-
-                # Concatenate the `original_image_embeds` with the `noisy_latents`.
-                concatenated_noisy_latents = torch.cat(
-                    [noisy_latents, original_image_embeds], dim=1
+                noisy_latents = noise_scheduler.add_noise(latents.float(), noise.float(), timesteps).to(
+                    dtype=weight_dtype
                 )
 
+                # Get the text embedding for conditioning
+                encoder_hidden_states = text_encoder(batch["input_ids"], return_dict=False)[0]
+
+                original_image_embeds = vae.encode(batch["original_pixel_values"].to(weight_dtype)).latent_dist.mode()
+
+                # Concatenate the `original_image_embeds` with the `noisy_latents`.
+                concatenated_noisy_latents = torch.cat([noisy_latents, original_image_embeds], dim=1)
+
                 controlnet_image_before_depth = (
-                    batch["before_depth_pixel_values"]
-                    .to(dtype=weight_dtype)
-                    .repeat(1, 3, 1, 1)
+                    batch["before_depth_pixel_values"].to(dtype=weight_dtype).repeat(1, 3, 1, 1)
                 )  # [bs, 3, h, w]
 
-                controlnet_image_before_seg = batch["before_seg_pixel_values"].to(
-                    dtype=weight_dtype
-                )  # [bs, 3, h, w]
+                controlnet_image_before_seg = batch["before_seg_pixel_values"].to(dtype=weight_dtype)  # [bs, 3, h, w]
                 # 将两种输入进行拼接
                 controlnet_image = torch.cat(
                     [controlnet_image_before_depth, controlnet_image_before_seg], dim=1
@@ -986,12 +870,9 @@ def main(args):
                     timesteps,
                     encoder_hidden_states=encoder_hidden_states,
                     down_block_additional_residuals=[
-                        sample.to(dtype=weight_dtype)
-                        for sample in down_block_res_samples
+                        sample.to(dtype=weight_dtype) for sample in down_block_res_samples
                     ],
-                    mid_block_additional_residual=mid_block_res_sample.to(
-                        dtype=weight_dtype
-                    ),
+                    mid_block_additional_residual=mid_block_res_sample.to(dtype=weight_dtype),
                     return_dict=False,
                 )[0]
 
@@ -1001,9 +882,7 @@ def main(args):
                 elif noise_scheduler.config.prediction_type == "v_prediction":
                     target = noise_scheduler.get_velocity(latents, noise, timesteps)
                 else:
-                    raise ValueError(
-                        f"Unknown prediction type {noise_scheduler.config.prediction_type}"
-                    )
+                    raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
                 loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
                 # TODO: 可以加入高频损失
 
@@ -1031,36 +910,24 @@ def main(args):
                         # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
                         if args.checkpoints_total_limit is not None:
                             checkpoints = os.listdir(args.output_dir)
-                            checkpoints = [
-                                d for d in checkpoints if d.startswith("checkpoint")
-                            ]
-                            checkpoints = sorted(
-                                checkpoints, key=lambda x: int(x.split("-")[1])
-                            )
+                            checkpoints = [d for d in checkpoints if d.startswith("checkpoint")]
+                            checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))
 
                             # before we save the new checkpoint, we need to have at _most_ `checkpoints_total_limit - 1` checkpoints
                             if len(checkpoints) >= args.checkpoints_total_limit:
-                                num_to_remove = (
-                                    len(checkpoints) - args.checkpoints_total_limit + 1
-                                )
+                                num_to_remove = len(checkpoints) - args.checkpoints_total_limit + 1
                                 removing_checkpoints = checkpoints[0:num_to_remove]
 
                                 logger.info(
                                     f"{len(checkpoints)} checkpoints already exist, removing {len(removing_checkpoints)} checkpoints"
                                 )
-                                logger.info(
-                                    f"removing checkpoints: {', '.join(removing_checkpoints)}"
-                                )
+                                logger.info(f"removing checkpoints: {', '.join(removing_checkpoints)}")
 
                                 for removing_checkpoint in removing_checkpoints:
-                                    removing_checkpoint = os.path.join(
-                                        args.output_dir, removing_checkpoint
-                                    )
+                                    removing_checkpoint = os.path.join(args.output_dir, removing_checkpoint)
                                     shutil.rmtree(removing_checkpoint)
 
-                        save_path = os.path.join(
-                            args.output_dir, f"checkpoint-{global_step}"
-                        )
+                        save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
 
@@ -1089,9 +956,7 @@ def main(args):
                     variant=args.variant,
                     torch_dtype=weight_dtype,
                 )
-                log_validation(
-                    pipeline, args, accelerator, generator, epoch, val_dataset_fixed
-                )
+                log_validation(pipeline, args, accelerator, generator, epoch, val_dataset_fixed)
 
                 if args.use_ema:
                     # Switch back to the original ControlNet parameters.
