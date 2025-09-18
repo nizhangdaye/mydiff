@@ -92,15 +92,13 @@ class ImageEditDataset(TorchDataset):
         # Load the dataset
         self._load_dataset()
 
-        # Setup image transforms
-        self._setup_transforms()
+        # # Setup image transforms
+        # self._setup_transforms()
 
         # 新增：image_transforms 和 conditioning_image_transforms
         self.image_transforms = transforms.Compose(
             [
-                transforms.Resize(
-                    self.resolution, interpolation=transforms.InterpolationMode.BILINEAR
-                ),
+                transforms.Resize(self.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
                 transforms.CenterCrop(self.resolution),
                 transforms.ToTensor(),
                 transforms.Normalize([0.5], [0.5]),
@@ -108,9 +106,7 @@ class ImageEditDataset(TorchDataset):
         )
         self.conditioning_image_transforms = transforms.Compose(
             [
-                transforms.Resize(
-                    self.resolution, interpolation=transforms.InterpolationMode.BILINEAR
-                ),
+                transforms.Resize(self.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
                 transforms.CenterCrop(self.resolution),
                 transforms.ToTensor(),
             ]
@@ -124,8 +120,7 @@ class ImageEditDataset(TorchDataset):
         # Select the appropriate split
         if self.split not in full_dataset:
             raise ValueError(
-                f"Split '{self.split}' not found in dataset. "
-                f"Available splits: {list(full_dataset.keys())}"
+                f"Split '{self.split}' not found in dataset. Available splits: {list(full_dataset.keys())}"
             )
 
         self.dataset = full_dataset[self.split]
@@ -134,27 +129,26 @@ class ImageEditDataset(TorchDataset):
         if self.max_samples is not None:
             if self.seed is not None:
                 self.dataset = self.dataset.shuffle(seed=self.seed)
-            self.dataset = self.dataset.select(
-                range(min(self.max_samples, len(self.dataset)))
-            )
+            self.dataset = self.dataset.select(range(min(self.max_samples, len(self.dataset))))
 
         print(f"Loaded {len(self.dataset)} samples from {self.split} split")
 
-    def _setup_transforms(self):
-        """Setup image transforms based on configuration."""
-        transform_list = []
+    # # TODO: 添加新的数据处理逻辑
+    # def _setup_transforms(self):
+    #     """Setup image transforms based on configuration."""
+    #     transform_list = []
 
-        if self.center_crop:
-            transform_list.append(transforms.CenterCrop(self.resolution))
-        else:
-            transform_list.append(transforms.RandomCrop(self.resolution))
+    #     if self.center_crop:
+    #         transform_list.append(transforms.CenterCrop(self.resolution))
+    #     else:
+    #         transform_list.append(transforms.RandomCrop(self.resolution))
 
-        if self.random_flip:
-            transform_list.append(transforms.RandomHorizontalFlip())
-        else:
-            transform_list.append(transforms.Lambda(lambda x: x))
+    #     if self.random_flip:
+    #         transform_list.append(transforms.RandomHorizontalFlip())
+    #     # else:
+    #     #     transform_list.append(transforms.Lambda(lambda x: x))
 
-        self.train_transforms = transforms.Compose(transform_list)
+    #     self.train_transforms = transforms.Compose(transform_list)
 
     def tokenize_captions(self, captions: List[str]) -> torch.Tensor:
         """Tokenize text captions using the CLIP tokenizer.
@@ -180,7 +174,9 @@ class ImageEditDataset(TorchDataset):
         after_images: List[PIL.Image.Image],
         before_depth_images: List[PIL.Image.Image],
         before_seg_images: List[PIL.Image.Image],
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        after_depth_images: List[PIL.Image.Image],
+        after_seg_images: List[PIL.Image.Image],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Preprocess before and after images, depth and seg images.
 
         Args:
@@ -188,25 +184,43 @@ class ImageEditDataset(TorchDataset):
             after_images: List of edited images
             before_depth_images: List of depth images
             before_seg_images: List of seg images
+            after_depth_images: List of after depth images
+            after_seg_images: List of after seg images
 
         Returns:
-            Tuple of (original_images_tensor, edited_images_tensor, depth_tensor, seg_tensor)
+            Tuple of (original_images_tensor, edited_images_tensor, before_depth_tensor, before_seg_tensor, after_depth_tensor, after_seg_tensor)
         """
         # 原图和编辑图像
-        original_images = torch.stack(
-            [self.image_transforms(img) for img in before_images]
-        )
-        edited_images = torch.stack(
-            [self.image_transforms(img) for img in after_images]
-        )
+        original_images = torch.stack([self.image_transforms(img) for img in before_images])
+        edited_images = torch.stack([self.image_transforms(img) for img in after_images])
         # depth 和 seg 作为条件图像
-        before_depth_images = torch.stack(
-            [self.conditioning_image_transforms(img) for img in before_depth_images]
+        before_depth_images = torch.stack([self.conditioning_image_transforms(img) for img in before_depth_images])
+        before_seg_images = torch.stack([self.conditioning_image_transforms(img) for img in before_seg_images])
+        after_depth_images = torch.stack([self.conditioning_image_transforms(img) for img in after_depth_images])
+        after_seg_images = torch.stack([self.conditioning_image_transforms(img) for img in after_seg_images])
+        return (
+            original_images,
+            edited_images,
+            before_depth_images,
+            before_seg_images,
+            after_depth_images,
+            after_seg_images,
         )
-        before_seg_images = torch.stack(
-            [self.conditioning_image_transforms(img) for img in before_seg_images]
-        )
-        return original_images, edited_images, before_depth_images, before_seg_images
+
+    def _random_augment(self, images: List[PIL.Image.Image]) -> List[PIL.Image.Image]:
+        """对一组图像做一致的随机上下翻转、左右翻转、90度倍数旋转."""
+
+        # 随机决定是否上下翻转
+        if random.random() < 0.5:
+            images = [img.transpose(PIL.Image.FLIP_TOP_BOTTOM) for img in images]
+        # 随机决定是否左右翻转
+        if random.random() < 0.5:
+            images = [img.transpose(PIL.Image.FLIP_LEFT_RIGHT) for img in images]
+        # 随机旋转 0, 90, 180, 270 度
+        k = random.randint(0, 3)
+        if k > 0:
+            images = [img.rotate(90 * k) for img in images]
+        return images
 
     def __len__(self) -> int:
         """Return the number of samples in the dataset."""
@@ -225,9 +239,11 @@ class ImageEditDataset(TorchDataset):
 
         # Get the images
         before_image = sample["before"]
-        after_image = sample["after"]
         before_depth_image = sample["before_depth"]
         before_seg_image = sample["before_seg"]
+        after_image = sample["after"]
+        after_depth_image = sample["after_depth"]
+        after_seg_image = sample["after_seg"]
 
         # Get edit instruction based on configuration
         if self.use_fixed_edit_text:
@@ -246,6 +262,17 @@ class ImageEditDataset(TorchDataset):
             before_depth_image = PIL.Image.fromarray(before_depth_image)
         if not isinstance(before_seg_image, PIL.Image.Image):
             before_seg_image = PIL.Image.fromarray(before_seg_image)
+        if not isinstance(after_depth_image, PIL.Image.Image):
+            after_depth_image = PIL.Image.fromarray(after_depth_image)
+        if not isinstance(after_seg_image, PIL.Image.Image):
+            after_seg_image = PIL.Image.fromarray(after_seg_image)
+
+        # 如果是训练集，做一致的数据增强
+        if self.split == "train":
+            imgs = [before_image, after_image, before_depth_image, before_seg_image, after_depth_image, after_seg_image]
+            before_image, after_image, before_depth_image, before_seg_image, after_depth_image, after_seg_image = (
+                self._random_augment(imgs)
+            )
 
         # Preprocess images
         (
@@ -253,8 +280,15 @@ class ImageEditDataset(TorchDataset):
             edited_pixel_values,
             before_depth_pixel_values,
             before_seg_pixel_values,
+            after_depth_pixel_values,
+            after_seg_pixel_values,
         ) = self.preprocess_images(
-            [before_image], [after_image], [before_depth_image], [before_seg_image]
+            [before_image],
+            [after_image],
+            [before_depth_image],
+            [before_seg_image],
+            [after_depth_image],
+            [after_seg_image],
         )
 
         # Tokenize the edit instruction
@@ -266,6 +300,8 @@ class ImageEditDataset(TorchDataset):
             "input_ids": input_ids.squeeze(0),
             "before_depth_pixel_values": before_depth_pixel_values.squeeze(0),
             "before_seg_pixel_values": before_seg_pixel_values.squeeze(0),
+            "after_depth_pixel_values": after_depth_pixel_values.squeeze(0),
+            "after_seg_pixel_values": after_seg_pixel_values.squeeze(0),
         }
 
 
@@ -278,35 +314,25 @@ def collate_fn(examples: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tenso
     Returns:
         Batched data dictionary
     """
-    original_pixel_values = torch.stack(
-        [example["original_pixel_values"] for example in examples]
-    )
-    original_pixel_values = original_pixel_values.to(
-        memory_format=torch.contiguous_format
-    ).float()
+    original_pixel_values = torch.stack([example["original_pixel_values"] for example in examples])
+    original_pixel_values = original_pixel_values.to(memory_format=torch.contiguous_format).float()
 
-    edited_pixel_values = torch.stack(
-        [example["edited_pixel_values"] for example in examples]
-    )
-    edited_pixel_values = edited_pixel_values.to(
-        memory_format=torch.contiguous_format
-    ).float()
+    edited_pixel_values = torch.stack([example["edited_pixel_values"] for example in examples])
+    edited_pixel_values = edited_pixel_values.to(memory_format=torch.contiguous_format).float()
 
     input_ids = torch.stack([example["input_ids"] for example in examples])
 
-    before_depth_pixel_values = torch.stack(
-        [example["before_depth_pixel_values"] for example in examples]
-    ).float()
-    before_depth_pixel_values = before_depth_pixel_values.to(
-        memory_format=torch.contiguous_format
-    ).float()
+    before_depth_pixel_values = torch.stack([example["before_depth_pixel_values"] for example in examples]).float()
+    before_depth_pixel_values = before_depth_pixel_values.to(memory_format=torch.contiguous_format).float()
 
-    before_seg_pixel_values = torch.stack(
-        [example["before_seg_pixel_values"] for example in examples]
-    ).float()
-    before_seg_pixel_values = before_seg_pixel_values.to(
-        memory_format=torch.contiguous_format
-    ).float()
+    before_seg_pixel_values = torch.stack([example["before_seg_pixel_values"] for example in examples]).float()
+    before_seg_pixel_values = before_seg_pixel_values.to(memory_format=torch.contiguous_format).float()
+
+    after_depth_pixel_values = torch.stack([example["after_depth_pixel_values"] for example in examples]).float()
+    after_depth_pixel_values = after_depth_pixel_values.to(memory_format=torch.contiguous_format).float()
+
+    after_seg_pixel_values = torch.stack([example["after_seg_pixel_values"] for example in examples]).float()
+    after_seg_pixel_values = after_seg_pixel_values.to(memory_format=torch.contiguous_format).float()
 
     return {
         "original_pixel_values": original_pixel_values,
@@ -314,6 +340,8 @@ def collate_fn(examples: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tenso
         "input_ids": input_ids,
         "before_depth_pixel_values": before_depth_pixel_values,
         "before_seg_pixel_values": before_seg_pixel_values,
+        "after_depth_pixel_values": after_depth_pixel_values,
+        "after_seg_pixel_values": after_seg_pixel_values,
     }
 
 
@@ -340,15 +368,15 @@ if __name__ == "__main__":
     )
     from torch.utils.data import DataLoader
 
-    train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True, num_workers=4)
+    train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True, num_workers=4, collate_fn=collate_fn)
 
     # 4. 遍历示例
     for batch in train_loader:
         print("Original pixel values shape:", batch["original_pixel_values"].shape)
         print("Edited pixel values shape:", batch["edited_pixel_values"].shape)
-        print(
-            "Before depth pixel values shape:", batch["before_depth_pixel_values"].shape
-        )
+        print("Before depth pixel values shape:", batch["before_depth_pixel_values"].shape)
         print("Before seg pixel values shape:", batch["before_seg_pixel_values"].shape)
+        print("After depth pixel values shape:", batch["after_depth_pixel_values"].shape)
+        print("After seg pixel values shape:", batch["after_seg_pixel_values"].shape)
         print("Input IDs shape:", batch["input_ids"].shape)
         break
