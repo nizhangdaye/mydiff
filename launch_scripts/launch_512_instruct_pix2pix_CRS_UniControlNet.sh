@@ -5,7 +5,7 @@
 export HF_HOME="/mnt/data/zwh/cache/huggingface"
 export MODEL_NAME="/mnt/data/zwh/log/instruct-pix2pix/experiment_0"
 
-export OUT_DIR="/mnt/data/zwh/log/instruct-pix2pix-CRS-UniControlNet/experiment_2"
+export OUT_DIR="/mnt/data/zwh/log/instruct-pix2pix-CRS-UniControlNet/experiment_2_zero_conv"
 # 离线模式
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
@@ -22,7 +22,7 @@ accelerate launch --config_file="$1" \
   --train_batch_size=16 \
   --gradient_accumulation_steps=2 \
   --gradient_checkpointing \
-  --checkpointing_steps=1 \
+  --checkpointing_steps=500 \
   --checkpoints_total_limit=5 \
   --learning_rate=1e-5 \
   --lr_scheduler="cosine" \
@@ -30,10 +30,11 @@ accelerate launch --config_file="$1" \
   --resume_from_checkpoint="latest" \
   --dataloader_num_workers=4 \
   --validation_epochs=1 \
-  --num_train_epochs=10 \
+  --num_train_epochs=100 \
   --enable_xformers_memory_efficient_attention \
-  --use_ema
-# --lr_warmup_steps=1000 \
+  --use_ema \
+  --replace_zero_conv \
+  --lr_warmup_steps=315
 # --use_fixed_edit_text \
 # num_train_epochs=2000 \
 # --seed \

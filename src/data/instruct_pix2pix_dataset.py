@@ -199,12 +199,12 @@ class ImageEditDataset(TorchDataset):
         after_depth_images = torch.stack([self.conditioning_image_transforms(img) for img in after_depth_images])
         after_seg_images = torch.stack([self.conditioning_image_transforms(img) for img in after_seg_images])
         return (
-            original_images,
-            edited_images,
-            before_depth_images,
-            before_seg_images,
-            after_depth_images,
-            after_seg_images,
+            original_images,  # 数值范围 [-1, 1]
+            edited_images,  # 数值范围 [-1, 1]
+            before_depth_images,  # 数值范围 [0, 1]
+            before_seg_images,  # 数值范围 [0, 1]
+            after_depth_images,  # 数值范围 [0, 1]
+            after_seg_images,  # 数值范围 [0, 1]
         )
 
     def _random_augment(self, images: List[PIL.Image.Image]) -> List[PIL.Image.Image]:

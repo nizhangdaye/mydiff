@@ -9,7 +9,6 @@ from diffusers.models.controlnets.controlnet import ControlNetModel, ControlNetO
 from diffusers.models.embeddings import TimestepEmbedding
 from torch.nn import functional as F
 
-from ..sat_unet import SatelliteUNet2DConditionModel
 from .uni_control_local_adapter import (
     LocalAdapterInjectionHelper,
     LocalResBlock,
@@ -82,6 +81,7 @@ class CRSDifUniControlNet(ControlNetModel):
         use_metadata: bool = False,
         num_metadata: int = 7,
         use_local_adapter_injection: bool = True,
+        replace_zero_conv: bool = False,
         local_adapter_inject_channels: Tuple[int, int, int, int] = (192, 256, 384, 512),
         **kwargs,
     ):
@@ -146,6 +146,19 @@ class CRSDifUniControlNet(ControlNetModel):
                 self.config.conditioning_channels, local_adapter_inject_channels
             )
             self._replace_with_local_resblocks(local_adapter_inject_channels)
+
+        if replace_zero_conv:
+            self._replace_with_zero_conv()
+
+    def _replace_with_zero_conv(self):
+        """将 controlnet 的零卷积进行替换"""
+        for i in range(len(self.controlnet_down_blocks)):
+            # print(f"替换第 {i} 个 controlnet_down_block 的零卷积")
+            old_block = self.controlnet_down_blocks[i]
+            self.controlnet_down_blocks[i] = nn.Conv2d(old_block.in_channels, old_block.out_channels, kernel_size=1)
+        # print("替换最后一个 controlnet_mid_block 的零卷积")
+        old_mid = self.controlnet_mid_block
+        self.controlnet_mid_block = nn.Conv2d(old_mid.in_channels, old_mid.out_channels, kernel_size=1)
 
     def _replace_with_local_resblocks(self, inject_channels):
         """替换每个 down_block 中第一个 ResBlock 为 LocalResBlock"""
@@ -387,11 +400,12 @@ class CRSDifUniControlNet(ControlNetModel):
     @classmethod
     def from_unet(
         cls,
-        unet: SatelliteUNet2DConditionModel,
+        unet,
         controlnet_conditioning_channel_order: str = "rgb",
         conditioning_embedding_out_channels: Optional[Tuple[int]] = (16, 32, 96, 256),
         load_weights_from_unet: bool = True,
         conditioning_in_channels: int = 3,  # 条件图像通道总数
+        replace_zero_conv: bool = False,
     ):
         transformer_layers_per_block = (
             unet.config.transformer_layers_per_block if "transformer_layers_per_block" in unet.config else 1
@@ -434,6 +448,7 @@ class CRSDifUniControlNet(ControlNetModel):
             controlnet_conditioning_channel_order=controlnet_conditioning_channel_order,
             conditioning_embedding_out_channels=conditioning_embedding_out_channels,
             conditioning_channels=conditioning_in_channels,
+            replace_zero_conv=replace_zero_conv,
         )
 
         if load_weights_from_unet:
@@ -487,13 +502,20 @@ if __name__ == "__main__":
         "/mnt/data/zwh/model/DiffusionSat/checkpoint-100000",
         subfolder="unet",
     )
-    uni_controlnet = CRSDifUniControlNet.from_unet(unet, conditioning_in_channels=6)
+    uni_controlnet = CRSDifUniControlNet.from_unet(
+        unet,
+        conditioning_in_channels=6,
+        replace_zero_conv=True,
+    )
     # 打印模型结构
     print(uni_controlnet)
     # 进行一次前向传播测试
-    uni_controlnet(
+    down_block_res_samples, mid_block_res_sample = uni_controlnet(
         sample=torch.randn(1, 4, 64, 64),
         timestep=10,
         encoder_hidden_states=torch.randn(1, 77, 1024),
         controlnet_cond=torch.randn(1, 6, 512, 512),
+        return_dict=False,
     )
+    print(down_block_res_samples[0].shape)
+    print(mid_block_res_sample.shape)

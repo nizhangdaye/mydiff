@@ -447,6 +447,11 @@ def parse_args():
         action="store_true",
         help="Whether to use fixed edit text based on disaster type instead of dataset edit text.",
     )
+    parser.add_argument(
+        "--replace_zero_conv",
+        action="store_true",
+        help="Whether to replace zero conv in ControlNet.",
+    )
 
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
@@ -536,7 +541,11 @@ def main(args):
         safety_checker=None,
         requires_safety_checker=False,
     )
-    controlnet = CRSDifUniControlNet.from_unet(unet, conditioning_in_channels=6)
+    controlnet = CRSDifUniControlNet.from_unet(
+        unet,
+        conditioning_in_channels=6,
+        replace_zero_conv=args.replace_zero_conv,
+    )
 
     # 加载 instruct-pix2pix 的 unet
     unet = UNet2DConditionModel.from_pretrained(
@@ -673,8 +682,8 @@ def main(args):
             resolution=args.resolution,
             split="train",
             center_crop=args.center_crop,
-            # max_samples=args.max_train_samples,
-            max_samples=10,
+            max_samples=args.max_train_samples,
+            # max_samples=10,
             seed=args.seed,
             use_fixed_edit_text=args.use_fixed_edit_text,
         )
