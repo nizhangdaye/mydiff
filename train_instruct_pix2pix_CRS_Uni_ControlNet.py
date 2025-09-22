@@ -78,7 +78,6 @@ def image_grid(imgs, rows, cols):
     return grid
 
 
-# TODO: 修改这里的validation逻辑
 def log_validation(pipeline, args, accelerator, generator, epoch, val_dataset):
     logger.info("Running validation... ")
 

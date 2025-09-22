@@ -109,6 +109,7 @@ class ImageEditDataset(TorchDataset):
                 transforms.Resize(self.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
                 transforms.CenterCrop(self.resolution),
                 transforms.ToTensor(),
+                transforms.Normalize([0.5], [0.5]),  # TODO: check if this is correct 将条件图像也归一化为 [-1, 1]
             ]
         )
 
@@ -133,7 +134,6 @@ class ImageEditDataset(TorchDataset):
 
         print(f"Loaded {len(self.dataset)} samples from {self.split} split")
 
-    # # TODO: 添加新的数据处理逻辑
     # def _setup_transforms(self):
     #     """Setup image transforms based on configuration."""
     #     transform_list = []
@@ -201,10 +201,10 @@ class ImageEditDataset(TorchDataset):
         return (
             original_images,  # 数值范围 [-1, 1]
             edited_images,  # 数值范围 [-1, 1]
-            before_depth_images,  # 数值范围 [0, 1]
-            before_seg_images,  # 数值范围 [0, 1]
-            after_depth_images,  # 数值范围 [0, 1]
-            after_seg_images,  # 数值范围 [0, 1]
+            before_depth_images,  # 数值范围 [-1, 1]
+            before_seg_images,  # 数值范围 [-1, 1]
+            after_depth_images,  # 数值范围 [-1, 1]
+            after_seg_images,  # 数值范围 [-1, 1]
         )
 
     def _random_augment(self, images: List[PIL.Image.Image]) -> List[PIL.Image.Image]:
