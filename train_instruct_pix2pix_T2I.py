@@ -745,7 +745,7 @@ def main():
 
         # epoch 平均损失日志
         # if accelerator.is_main_process:  TODO 其他进程的优化器学习率不会更新
-        accelerator.print(f"Epoch {epoch} average loss: {epoch_avg_loss:.6f}")
+        accelerator.print(f"Epoch {epoch + 1} average loss: {epoch_avg_loss:.6f}")
         log_payload = {"epoch_avg_loss": epoch_avg_loss}
         if sched_cfg.get("lr_scheduler") == "plateau":
             # ReduceLROnPlateau 在 epoch 结束后根据 loss 调整
