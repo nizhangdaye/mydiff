@@ -134,14 +134,16 @@ def run_epoch(
     返回: (epoch_average_loss, 更新后的 global_step)
     统计的平均损失为该 epoch 内所有优化(完成一次梯度累计)步骤 loss 的算术平均。
     """
-    # 用于累计日志用的 loss（按 step 打印）
-    accum_loss_for_log = 0.0
-    # 用于计算 epoch 平均 loss（只在完成一次优化步骤时统计）
+    # 累计一个“优化 step”内所有 micro step 的 loss 之和（未平均）
+    accum_loss_sum = 0.0
+    # 当前累计组包含的 micro step 数
+    micro_count = 0
+    # epoch 级统计（保存每个优化 step 的平均 loss 的和）
     total_optim_loss = 0.0
     optim_steps_in_epoch = 0
 
     for step, batch in enumerate(train_dataloader):
-        with accelerator.accumulate(unet):
+        with accelerator.accumulate(unet, adapter):
             with accelerator.autocast():
                 # 1. 将编辑后图像编码为 latent
                 latents = vae.encode(batch["edited_pixel_values"].to(weight_dtype)).latent_dist.sample()
@@ -232,12 +234,16 @@ def run_epoch(
 
             # 11. 分布式收集用于日志（保持与原实现一致）
             avg_loss = accelerator.gather(loss.repeat(train_cfg.get("train_batch_size"))).mean()
-            accum_loss_for_log += avg_loss.item() / train_cfg.get("gradient_accumulation_steps")
+            # 不在这里做除法，保持真实求和；最后一个不完整累计组只除以实际 micro_count
+            accum_loss_sum += avg_loss.item()
+            micro_count += 1
 
             # 12. 反向与优化
             accelerator.backward(loss)
             if accelerator.sync_gradients:
-                accelerator.clip_grad_norm_(unet.parameters(), opt_cfg.get("max_grad_norm"))
+                accelerator.clip_grad_norm_(
+                    list(unet.parameters()) + list(adapter.parameters()), opt_cfg.get("max_grad_norm")
+                )
             optimizer.step()
             if lr_scheduler is not None:  # 非 plateau scheduler
                 lr_scheduler.step()
@@ -250,18 +256,24 @@ def run_epoch(
                     ema_unet.step(unet.parameters())
                 if ema_adapter is not None and adapter is not None:
                     ema_adapter.step(adapter.parameters())
+
+            # 计算该“优化 step”真实平均 loss
+            step_loss = accum_loss_sum / micro_count
+
             progress_bar.update(1)
             global_step += 1
             optim_steps_in_epoch += 1
-            total_optim_loss += accum_loss_for_log
+            total_optim_loss += step_loss
 
-            # 记录 step 级日志
-            logs = {"step_loss": accum_loss_for_log}
+            logs = {"step_loss": step_loss}
             if lr_scheduler is not None:
                 logs["lr"] = lr_scheduler.get_last_lr()[0]
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
-            accum_loss_for_log = 0.0
+
+            # 重置 micro 级累计
+            accum_loss_sum = 0.0
+            micro_count = 0
 
     epoch_avg_loss = (total_optim_loss / optim_steps_in_epoch) if optim_steps_in_epoch > 0 else float("nan")
     return epoch_avg_loss, global_step
@@ -324,9 +336,8 @@ def log_validation(
             # 条件图构建（深度 + seg -> 6 通道），若缺失则用黑图
             before_depth_tensor = transforms.ToTensor()(before_depth_img)
             before_seg_tensor = transforms.ToTensor()(before_seg_img)
-            conditioning_image = (
-                torch.cat([before_depth_tensor, before_seg_tensor], dim=0).unsqueeze(0).to(accelerator.device)
-            )
+            # 若未来使用多条件输入，可构造 6 通道：
+            conditioning_image = torch.cat([before_depth_tensor, before_seg_tensor], dim=0).unsqueeze(0)
 
             # TODO: T2I 目前不支持多种条件输入，暂时使用 before_depth_tensor
             edited_image = pipeline(
@@ -498,6 +509,7 @@ def main():
 
     if train_cfg.get("gradient_checkpointing"):
         unet.enable_gradient_checkpointing()
+        adapter.enable_gradient_checkpointing()
 
     # Enable TF32 for faster training on Ampere GPUs,
     # cf https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices
@@ -568,7 +580,7 @@ def main():
         collate_fn=collate_fn,
         batch_size=train_cfg.get("train_batch_size"),
         num_workers=data_cfg.get("dataloader_num_workers"),
-        drop_last=True,
+        # drop_last=True,
     )
 
     # Scheduler and math around the number of training steps.
