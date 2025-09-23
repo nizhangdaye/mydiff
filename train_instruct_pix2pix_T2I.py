@@ -243,7 +243,8 @@ def run_epoch(
             if accelerator.sync_gradients:
                 accelerator.clip_grad_norm_(unet.parameters(), opt_cfg.get("max_grad_norm"))
             optimizer.step()
-            lr_scheduler.step()
+            if lr_scheduler is not None:  # 非 plateau scheduler
+                lr_scheduler.step()
             optimizer.zero_grad()
 
         # 13. 若完成一次优化（梯度已同步）
@@ -259,7 +260,9 @@ def run_epoch(
             total_optim_loss += accum_loss_for_log
 
             # 记录 step 级日志
-            logs = {"step_loss": accum_loss_for_log, "lr": lr_scheduler.get_last_lr()[0]}
+            logs = {"step_loss": accum_loss_for_log}
+            if lr_scheduler is not None:
+                logs["lr"] = lr_scheduler.get_last_lr()[0]
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
             accum_loss_for_log = 0.0
@@ -582,12 +585,21 @@ def main(config_path: str):
     else:
         num_training_steps_for_scheduler = max_train_steps * accelerator.num_processes
 
-    lr_scheduler = get_scheduler(
-        sched_cfg.get("lr_scheduler"),
-        optimizer=optimizer,
-        num_warmup_steps=num_warmup_steps_for_scheduler,
-        num_training_steps=num_training_steps_for_scheduler,
-    )
+    if sched_cfg.get("lr_scheduler") == "plateau":
+        lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="min",
+            factor=sched_cfg.get("plateau_factor"),
+            patience=sched_cfg.get("plateau_patience"),
+            verbose=accelerator.is_main_process,
+        )
+    else:
+        lr_scheduler = get_scheduler(
+            sched_cfg.get("lr_scheduler"),
+            optimizer=optimizer,
+            num_warmup_steps=num_warmup_steps_for_scheduler,
+            num_training_steps=num_training_steps_for_scheduler,
+        )
 
     # Prepare everything with our `accelerator`.
     unet, adapter, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
@@ -693,7 +705,7 @@ def main(config_path: str):
             train_dataloader=train_dataloader,
             accelerator=accelerator,
             optimizer=optimizer,
-            lr_scheduler=lr_scheduler,
+            lr_scheduler=lr_scheduler if not sched_cfg.get("lr_scheduler") == "plateau" else None,
             noise_scheduler=noise_scheduler,
             train_cfg=train_cfg,
             data_cfg=data_cfg,
@@ -734,7 +746,12 @@ def main(config_path: str):
         # epoch 平均损失日志
         if accelerator.is_main_process:
             accelerator.print(f"Epoch {epoch} average loss: {epoch_avg_loss:.6f}")
-            accelerator.log({"epoch_avg_loss": epoch_avg_loss}, step=global_step)
+            log_payload = {"epoch_avg_loss": epoch_avg_loss}
+            if sched_cfg.get("lr_scheduler") == "plateau":
+                # ReduceLROnPlateau 在 epoch 结束后根据 loss 调整
+                lr_scheduler.step(epoch_avg_loss)
+                log_payload.update({"lr": lr_scheduler.get_last_lr()[0]})
+            accelerator.log(log_payload, step=epoch)
 
         # ========== 最优模型保存逻辑 (基于 epoch 平均 loss) ==========
         # 在主进程比较并保存最优 checkpoint (含状态)。
