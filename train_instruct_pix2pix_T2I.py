@@ -568,6 +568,7 @@ def main():
         collate_fn=collate_fn,
         batch_size=train_cfg.get("train_batch_size"),
         num_workers=data_cfg.get("dataloader_num_workers"),
+        drop_last=True,
     )
 
     # Scheduler and math around the number of training steps.
