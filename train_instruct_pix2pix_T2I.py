@@ -509,7 +509,8 @@ def main():
 
     if train_cfg.get("gradient_checkpointing"):
         unet.enable_gradient_checkpointing()
-        adapter.enable_gradient_checkpointing()
+        # T2IAdapter does not support gradient checkpointing
+        # adapter.enable_gradient_checkpointing()
 
     # Enable TF32 for faster training on Ampere GPUs,
     # cf https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices
