@@ -1,3 +1,4 @@
+import argparse
 import logging
 import math
 import os
@@ -43,8 +44,6 @@ logger = get_logger(__name__, log_level="INFO")
 def load_config(config_path: str) -> dict:
     with open(config_path, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
-        print(f"加载配置文件: {config_path}，内容如下：")
-        print(yaml.dump(cfg, allow_unicode=True, sort_keys=False))
     return cfg
 
 
@@ -369,8 +368,11 @@ def log_validation(
             tracker.writer.add_text(f"validation/prompt_{r['sample_idx']}", r["prompt"], epoch)
 
 
-def main(config_path: str):
-    cfg = load_config(config_path)
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=str, default="config/train_instruct_p2p_T2I.yaml")
+    args = parser.parse_args()
+    cfg = load_config(args.config)
 
     # 解包配置子字典，便于引用
     model_cfg = cfg.get("model")
@@ -419,11 +421,12 @@ def main(config_path: str):
 
     # Handle the repository creation
     if accelerator.is_main_process:
+        print(f"配置文件：")
+        print(yaml.dump(cfg, allow_unicode=True, sort_keys=False))
         if output_dir is not None:
             os.makedirs(output_dir, exist_ok=True)
 
     # Load scheduler, tokenizer and models.
-
     noise_scheduler, tokenizer, text_encoder, vae, unet, adapter = load_model(model_cfg)
 
     unet = init_instructpix2pix_unet(unet)
@@ -591,7 +594,7 @@ def main(config_path: str):
             mode="min",
             factor=sched_cfg.get("plateau_factor"),
             patience=sched_cfg.get("plateau_patience"),
-            verbose=accelerator.is_main_process,
+            min_lr=sched_cfg.get("min_lr"),
         )
     else:
         lr_scheduler = get_scheduler(
@@ -744,14 +747,14 @@ def main(config_path: str):
                 logger.info(f"[Epoch Save] Saved state to {save_path}")
 
         # epoch 平均损失日志
-        if accelerator.is_main_process:
-            accelerator.print(f"Epoch {epoch} average loss: {epoch_avg_loss:.6f}")
-            log_payload = {"epoch_avg_loss": epoch_avg_loss}
-            if sched_cfg.get("lr_scheduler") == "plateau":
-                # ReduceLROnPlateau 在 epoch 结束后根据 loss 调整
-                lr_scheduler.step(epoch_avg_loss)
-                log_payload.update({"lr": lr_scheduler.get_last_lr()[0]})
-            accelerator.log(log_payload, step=epoch)
+        # if accelerator.is_main_process:  TODO 其他进程的优化器学习率不会更新
+        accelerator.print(f"Epoch {epoch} average loss: {epoch_avg_loss:.6f}")
+        log_payload = {"epoch_avg_loss": epoch_avg_loss}
+        if sched_cfg.get("lr_scheduler") == "plateau":
+            # ReduceLROnPlateau 在 epoch 结束后根据 loss 调整
+            lr_scheduler.step(epoch_avg_loss)
+            log_payload.update({"lr": lr_scheduler.get_last_lr()[0]})
+        accelerator.log(log_payload, step=epoch)
 
         # ========== 最优模型保存逻辑 (基于 epoch 平均 loss) ==========
         # 在主进程比较并保存最优 checkpoint (含状态)。
@@ -824,14 +827,10 @@ def main(config_path: str):
         )
         pipeline.save_pretrained(output_dir)
 
-    log_validation(pipeline, cfg, accelerator, generator, epoch, val_dataset)
+    if accelerator.is_main_process:
+        log_validation(pipeline, cfg, accelerator, generator, epoch, val_dataset)
     accelerator.end_training()
 
 
 if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, default="config/train_instruct_p2p_T2I.yaml")
-    args = parser.parse_args()
-    main(args.config)
+    main()

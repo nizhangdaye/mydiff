@@ -1,10 +1,11 @@
 # config.yaml
 seed: 42
-output_root: "/mnt/data/zwh/log/instructpix2pix_T2I"
+output_root: "/mnt/s1/zwh/log/instructpix2pix_T2I"
 
 model:
-  unet_path: "/mnt/data/zwh/model/DiffusionSat/checkpoint-100000"
-  pretrained_model_name_or_path: "stabilityai/stable-diffusion-2-1" # required, must be set
+  unet_path: "/mnt/s1/zwh/model/DiffusionSat/checkpoint-100000"
+  # pretrained_model_name_or_path: "stabilityai/stable-diffusion-2-1" # required, must be set
+  pretrained_model_name_or_path: "/mnt/s1/zwh/model/DiffusionSat" # required, must be set
   revision: null
   variant: null
   non_ema_revision: null
@@ -44,12 +45,13 @@ lr_scheduler:
   # - 使用 diffusers.get_scheduler 支持的名称 (如 constant, cosine, linear 等)
   # - 或使用自定义 "plateau" 启用 torch.optim.lr_scheduler.ReduceLROnPlateau
   lr_scheduler: "plateau"
-  lr_warmup_steps: 0  # 非 plateau 时生效
-  plateau_patience: 10  # plateau 模式：多少个 epoch 无改进后降 LR
-  plateau_factor: 0.5   # plateau 模式：LR 乘以该因子
+  lr_warmup_steps: 0 # 非 plateau 时生效
+  plateau_patience: 10 # plateau 模式：多少个 epoch 无改进后降 LR
+  plateau_factor: 0.5 # plateau 模式：LR 乘以该因子
+  min_lr: 2.0e-5 # 最小学习率
 
 data:
-  dataset_path: "/mnt/data/zwh/data/maxar/disaster_dataset"
+  dataset_path: "/mnt/s1/zwh/data/maxar/disaster_dataset"
   resolution: 512
   center_crop: false
   random_flip: false
