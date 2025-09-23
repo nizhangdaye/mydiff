@@ -14,7 +14,6 @@ import torch.nn.functional as F
 import transformers
 import yaml
 from accelerate import Accelerator
-from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import EMAModel
@@ -38,8 +37,6 @@ from diffusers import (
 from src.data.instruct_pix2pix_dataset import ImageEditDataset, collate_fn
 from src.pipeline.instructP2P_T2I_Pipeline import InstructPix2PixT2IAdapterPipeline
 
-logger = get_logger(__name__, log_level="INFO")
-
 
 def load_config(config_path: str) -> dict:
     with open(config_path, "r", encoding="utf-8") as f:
@@ -47,7 +44,7 @@ def load_config(config_path: str) -> dict:
     return cfg
 
 
-def load_model(model_cfg: dict):
+def load_model(model_cfg: dict, accelerator: Accelerator):
     noise_scheduler = DDPMScheduler.from_pretrained(
         model_cfg["pretrained_model_name_or_path"],
         subfolder="scheduler",
@@ -70,10 +67,10 @@ def load_model(model_cfg: dict):
         use_safetensors=False,
     )
     if model_cfg.get("t2i_adapter_path"):
-        logger.info(f"Loading T2IAdapter from {model_cfg.get('t2i_adapter_path')}")
+        accelerator.print(f"Loading T2IAdapter from {model_cfg.get('t2i_adapter_path')}")
         adapter = T2IAdapter.from_pretrained(model_cfg.get("t2i_adapter_path"))
     else:
-        logger.info("Initializing new T2IAdapter (random weights)")
+        accelerator.print("Initializing new T2IAdapter (random weights)")
         adapter = T2IAdapter(
             in_channels=model_cfg.get("t2i_adapter_in_channels"),
             channels=model_cfg.get("t2i_adapter_channels"),
@@ -84,13 +81,13 @@ def load_model(model_cfg: dict):
     return noise_scheduler, tokenizer, text_encoder, vae, unet, adapter
 
 
-def init_instructpix2pix_unet(unet):
+def init_instructpix2pix_unet(unet, accelerator: Accelerator):
     # InstructPix2Pix uses an additional image for conditioning. To accommodate that,
     # it uses 8 channels (instead of 4) in the first (conv) layer of the UNet. This UNet is
     # then fine-tuned on the custom InstructPix2Pix dataset. This modified UNet is initialized
     # from the pre-trained checkpoints. For the extra channels added to the first layer, they are
     # initialized to zero.
-    logger.info("Initializing the InstructPix2Pix UNet from the pretrained UNet.")
+    accelerator.print("Initializing the InstructPix2Pix UNet from the pretrained UNet.")
     in_channels = 8
     out_channels = unet.conv_in.out_channels
     unet.register_to_config(in_channels=in_channels)
@@ -294,7 +291,7 @@ def log_validation(
     resolution = cfg["data"].get("resolution")
     inference_steps = cfg["validation"].get("num_inference_steps")
 
-    logger.info(f"Running validation epoch={epoch} (steps={inference_steps}) on {len(val_dataset)} samples...")
+    accelerator.print(f"Running validation epoch={epoch} (steps={inference_steps}) on {len(val_dataset)} samples...")
 
     autocast_ctx = torch.autocast(accelerator.device.type)
     validation_results = []
@@ -427,9 +424,9 @@ def main():
             os.makedirs(output_dir, exist_ok=True)
 
     # Load scheduler, tokenizer and models.
-    noise_scheduler, tokenizer, text_encoder, vae, unet, adapter = load_model(model_cfg)
+    noise_scheduler, tokenizer, text_encoder, vae, unet, adapter = load_model(model_cfg, accelerator)
 
-    unet = init_instructpix2pix_unet(unet)
+    unet = init_instructpix2pix_unet(unet, accelerator)
 
     # Freeze vae and text_encoder
     vae.requires_grad_(False)
@@ -630,7 +627,7 @@ def main():
     if max_train_steps is None:
         max_train_steps = train_cfg.get("num_train_epochs") * num_update_steps_per_epoch
         if num_training_steps_for_scheduler != max_train_steps * accelerator.num_processes:
-            logger.warning(
+            accelerator.print(
                 f"The length of the 'train_dataloader' after 'accelerator.prepare' ({len(train_dataloader)}) does not match "
                 f"the expected length ({len_train_dataloader_after_sharding}) when the learning rate scheduler was created. "
                 f"This inconsistency may result in the learning rate scheduler not functioning properly."
@@ -648,13 +645,13 @@ def main():
         train_cfg.get("train_batch_size") * accelerator.num_processes * train_cfg.get("gradient_accumulation_steps")
     )
 
-    logger.info("***** Running training *****")
-    logger.info(f"  Num examples = {len(train_dataset)}")
-    logger.info(f"  Num Epochs = {num_train_epochs}")
-    logger.info(f"  Instantaneous batch size per device = {train_cfg.get('train_batch_size')}")
-    logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
-    logger.info(f"  Gradient Accumulation steps = {train_cfg.get('gradient_accumulation_steps')}")
-    logger.info(f"  Total optimization steps = {max_train_steps}")
+    accelerator.print("***** Running training *****")
+    accelerator.print(f"  Num examples = {len(train_dataset)}")
+    accelerator.print(f"  Num Epochs = {num_train_epochs}")
+    accelerator.print(f"  Instantaneous batch size per device = {train_cfg.get('train_batch_size')}")
+    accelerator.print(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
+    accelerator.print(f"  Gradient Accumulation steps = {train_cfg.get('gradient_accumulation_steps')}")
+    accelerator.print(f"  Total optimization steps = {max_train_steps}")
     global_step = 0
     first_epoch = 0
 
@@ -737,14 +734,14 @@ def main():
                     if len(checkpoints) >= train_cfg.get("checkpoints_total_limit"):
                         num_to_remove = len(checkpoints) - train_cfg.get("checkpoints_total_limit") + 1
                         removing_checkpoints = checkpoints[0:num_to_remove]
-                        logger.info(
+                        accelerator.print(
                             f"{len(checkpoints)} epoch checkpoints exist, removing {len(removing_checkpoints)}: {', '.join(removing_checkpoints)}"
                         )
                         for rc in removing_checkpoints:
                             shutil.rmtree(os.path.join(output_dir, rc))
                 save_path = os.path.join(output_dir, f"checkpoint-epoch-{epoch + 1}")
                 accelerator.save_state(save_path)
-                logger.info(f"[Epoch Save] Saved state to {save_path}")
+                accelerator.print(f"[Epoch Save] Saved state to {save_path}")
 
         # epoch 平均损失日志
         # if accelerator.is_main_process:  TODO 其他进程的优化器学习率不会更新
@@ -771,9 +768,9 @@ def main():
                     try:
                         shutil.rmtree(best_dir)
                     except Exception as e:  # pragma: no cover
-                        logger.warning(f"Failed removing old best checkpoint dir: {e}")
+                        accelerator.print(f"Failed removing old best checkpoint dir: {e}")
                 accelerator.save_state(best_dir)
-                logger.info(
+                accelerator.print(
                     f"[Best Model] Epoch {epoch} new best loss {epoch_avg_loss:.6f} (prev {prev:.6f}). Saved to {best_dir}"
                 )
 
