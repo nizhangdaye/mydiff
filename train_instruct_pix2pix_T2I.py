@@ -107,6 +107,290 @@ def init_instructpix2pix_unet(unet, accelerator: Accelerator):
     return unet
 
 
+def prepare_datasets_and_dataloader(
+    data_cfg: Dict[str, Any],
+    train_cfg: Dict[str, Any],
+    tokenizer: CLIPTokenizer,
+    accelerator: Accelerator,
+    seed: int | None,
+):
+    """构建训练与验证数据集和 DataLoader。"""
+    with accelerator.main_process_first():
+        train_dataset = ImageEditDataset(
+            dataset_path=data_cfg.get("dataset_path"),
+            tokenizer=tokenizer,
+            resolution=data_cfg.get("resolution"),
+            split="train",
+            center_crop=data_cfg.get("center_crop"),
+            random_flip=data_cfg.get("random_flip"),
+            max_samples=train_cfg.get("max_train_samples"),
+            seed=seed,
+            use_fixed_edit_text=data_cfg.get("use_fixed_edit_text"),
+        )
+
+        val_dataset = ImageEditDataset(
+            dataset_path=data_cfg.get("dataset_path"),
+            tokenizer=tokenizer,
+            resolution=data_cfg.get("resolution"),
+            split="test",
+            center_crop=False,
+            random_flip=False,
+            max_samples=10,
+            seed=seed,
+            use_fixed_edit_text=data_cfg.get("use_fixed_edit_text", False),
+        )
+
+    train_dataloader = torch.utils.data.DataLoader(
+        train_dataset,
+        shuffle=True,
+        collate_fn=collate_fn,
+        batch_size=train_cfg.get("train_batch_size"),
+        num_workers=data_cfg.get("dataloader_num_workers"),
+        # drop_last=True,
+    )
+
+    return train_dataset, val_dataset, train_dataloader
+
+
+def register_accelerator_saveload_hooks(
+    accelerator: Accelerator,
+    model_cfg: Dict[str, Any],
+    ema_unet: EMAModel | None,
+    ema_adapter: EMAModel | None,
+):
+    """注册 accelerator 保存/加载 hooks，用于按 diffusers 风格保存模型与 EMA。"""
+    import accelerate as _acc
+    from packaging import version as _version
+
+    if _version.parse(_acc.__version__) < _version.parse("0.16.0"):
+        return
+
+    def save_model_hook(models, weights, output_dir):
+        if accelerator.is_main_process:
+            if model_cfg.get("use_ema"):
+                assert ema_unet is not None and ema_adapter is not None
+                ema_unet.save_pretrained(os.path.join(output_dir, "unet_ema"))
+                ema_adapter.save_pretrained(os.path.join(output_dir, "t2iadapter_ema"))
+
+            for i, model in enumerate(models):
+                sub_dir = "unet" if isinstance(model, UNet2DConditionModel) else "t2iadapter"
+                model.save_pretrained(os.path.join(output_dir, sub_dir))
+                if weights:
+                    weights.pop()
+
+    def load_model_hook(models, input_dir):
+        if model_cfg.get("use_ema"):
+            assert ema_unet is not None and ema_adapter is not None
+            load_unet_ema = EMAModel.from_pretrained(os.path.join(input_dir, "unet_ema"), UNet2DConditionModel)
+            ema_unet.load_state_dict(load_unet_ema.state_dict())
+            ema_unet.to(accelerator.device)
+            del load_unet_ema
+            if os.path.isdir(os.path.join(input_dir, "t2iadapter_ema")):
+                load_adapter_ema = EMAModel.from_pretrained(os.path.join(input_dir, "t2iadapter_ema"))
+                ema_adapter.load_state_dict(load_adapter_ema.state_dict())
+                ema_adapter.to(accelerator.device)
+                del load_adapter_ema
+
+        for i in range(len(models)):
+            model = models.pop()
+            if isinstance(model, UNet2DConditionModel):
+                load_unet_model = UNet2DConditionModel.from_pretrained(input_dir, subfolder="unet")
+                model.register_to_config(**load_unet_model.config)
+                model.load_state_dict(load_unet_model.state_dict())
+                del load_unet_model
+            else:
+                load_adapter_model = T2IAdapter.from_pretrained(os.path.join(input_dir, "t2iadapter"))
+                model.load_state_dict(load_adapter_model.state_dict())
+                del load_adapter_model
+
+    accelerator.register_save_state_pre_hook(save_model_hook)
+    accelerator.register_load_state_pre_hook(load_model_hook)
+
+
+def maybe_resume_epoch_checkpoint(
+    accelerator: Accelerator,
+    output_dir: str,
+    train_cfg: Dict[str, Any],
+    num_update_steps_per_epoch: int,
+) -> tuple[int, int]:
+    """尝试按 epoch 粒度恢复，返回 (first_epoch, global_step)。"""
+    first_epoch = 0
+    global_step = 0
+    resume_from_checkpoint = train_cfg.get("resume_from_checkpoint")
+    if not resume_from_checkpoint:
+        return first_epoch, global_step
+
+    if resume_from_checkpoint == "latest":
+        dirs = [d for d in os.listdir(output_dir) if d.startswith("checkpoint-epoch-")]
+        dirs = sorted(dirs, key=lambda x: int(x.split("-epoch-")[1]))
+        latest = dirs[-1] if dirs else None
+        if latest is not None:
+            epoch_num = int(latest.split("-epoch-")[1])
+            accelerator.print(f"Resuming from epoch checkpoint {latest}")
+            accelerator.load_state(os.path.join(output_dir, latest))
+            first_epoch = epoch_num
+            global_step = epoch_num * num_update_steps_per_epoch
+        else:
+            accelerator.print("No epoch checkpoint found, starting fresh.")
+        return first_epoch, global_step
+    else:
+        base = os.path.basename(resume_from_checkpoint.rstrip("/"))
+        if base.startswith("checkpoint-epoch-"):
+            epoch_num = int(base.split("-epoch-")[1])
+            load_dir = (
+                resume_from_checkpoint if os.path.isdir(resume_from_checkpoint) else os.path.join(output_dir, base)
+            )
+            if not os.path.isdir(load_dir):
+                accelerator.print(f"Checkpoint directory {load_dir} not found; starting fresh.")
+            else:
+                accelerator.print(f"Resuming from epoch checkpoint {load_dir}")
+                accelerator.load_state(load_dir)
+                first_epoch = epoch_num
+                global_step = epoch_num * num_update_steps_per_epoch
+        else:
+            accelerator.print(f"Provided resume path {resume_from_checkpoint} is not an epoch checkpoint; ignored.")
+    return first_epoch, global_step
+
+
+def setup_lr_scheduler_and_steps(
+    sched_cfg: Dict[str, Any],
+    train_cfg: Dict[str, Any],
+    accelerator: Accelerator,
+    optimizer: torch.optim.Optimizer,
+    train_dataloader: DataLoader,
+    max_train_steps_cfg: int | None,
+):
+    """根据配置创建学习率调度器，并返回训练步数相关统计。
+
+    返回:
+    (
+        lr_scheduler,
+        num_warmup_steps_for_scheduler,
+        num_training_steps_for_scheduler,
+        max_train_steps,
+        len_train_dataloader_after_sharding,
+        num_update_steps_per_epoch_pre,
+    )
+    """
+    num_warmup_steps_for_scheduler = sched_cfg.get("lr_warmup_steps") * accelerator.num_processes
+    max_train_steps = max_train_steps_cfg
+    if max_train_steps is None:
+        len_train_dataloader_after_sharding = math.ceil(len(train_dataloader) / accelerator.num_processes)
+        num_update_steps_per_epoch_pre = math.ceil(
+            len_train_dataloader_after_sharding / train_cfg.get("gradient_accumulation_steps")
+        )
+        num_training_steps_for_scheduler = (
+            train_cfg.get("num_train_epochs") * num_update_steps_per_epoch_pre * accelerator.num_processes
+        )
+    else:
+        len_train_dataloader_after_sharding = math.ceil(len(train_dataloader) / accelerator.num_processes)
+        num_update_steps_per_epoch_pre = math.ceil(
+            len_train_dataloader_after_sharding / train_cfg.get("gradient_accumulation_steps")
+        )
+        num_training_steps_for_scheduler = max_train_steps * accelerator.num_processes
+
+    if sched_cfg.get("lr_scheduler") == "plateau":
+        lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="min",
+            factor=sched_cfg.get("plateau_factor"),
+            patience=sched_cfg.get("plateau_patience"),
+            min_lr=sched_cfg.get("min_lr"),
+        )
+    else:
+        lr_scheduler = get_scheduler(
+            sched_cfg.get("lr_scheduler"),
+            optimizer=optimizer,
+            num_warmup_steps=num_warmup_steps_for_scheduler,
+            num_training_steps=num_training_steps_for_scheduler,
+        )
+
+    return (
+        lr_scheduler,
+        num_warmup_steps_for_scheduler,
+        num_training_steps_for_scheduler,
+        max_train_steps,
+        len_train_dataloader_after_sharding,
+        num_update_steps_per_epoch_pre,
+    )
+
+
+def apply_text_and_cond_dropout(
+    encoder_hidden_states: torch.Tensor,
+    controlnet_image_before_depth: torch.Tensor,
+    controlnet_image_before_seg: torch.Tensor,
+    tokenizer: CLIPTokenizer,
+    text_encoder: CLIPTextModel,
+    data_cfg: Dict[str, Any],
+    bsz: int,
+    device: torch.device,
+    weight_dtype: torch.dtype,
+    accelerator: Accelerator,
+    generator: torch.Generator | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """根据 data.dropout 策略对文本条件与条件图进行随机丢弃。
+
+    返回: (encoder_hidden_states, depth_img, seg_img)
+    """
+    drop_cfg = data_cfg.get("dropout")
+    if drop_cfg is None:
+        return encoder_hidden_states, controlnet_image_before_depth, controlnet_image_before_seg
+
+    # 文本丢弃
+    p_txt = drop_cfg.get("drop_txt_prob")
+    if p_txt is not None and p_txt > 0:
+        rand_txt = torch.rand(bsz, device=device, generator=generator)
+        drop_txt_mask = (rand_txt < p_txt).reshape(bsz, 1, 1)
+        if drop_txt_mask.any():
+            null_inputs = tokenizer(
+                [""],
+                max_length=tokenizer.model_max_length,
+                padding="max_length",
+                truncation=True,
+                return_tensors="pt",
+            )
+            null_conditioning = text_encoder(null_inputs.input_ids.to(accelerator.device))[0]
+            # 广播到 batch
+            encoder_hidden_states = torch.where(drop_txt_mask, null_conditioning, encoder_hidden_states)
+
+    # 条件图丢弃（深度、语义）
+    p_keep_all = drop_cfg.get("keep_all_cond_prob")
+    p_drop_all = drop_cfg.get("drop_all_cond_prob")
+    per_cond = drop_cfg.get("drop_each_cond_prob")
+    p_depth = float(per_cond[0])
+    p_seg = float(per_cond[1])
+
+    rand_keep = torch.rand(bsz, device=device, generator=generator)
+    keep_all = rand_keep < p_keep_all
+
+    rand_dropall = torch.rand(bsz, device=device, generator=generator)
+    drop_all = (~keep_all) & (rand_dropall < p_drop_all)
+
+    # 独立丢弃（仅在未 keep_all 且未 drop_all 的样本上生效）
+    rand_depth = torch.rand(bsz, device=device, generator=generator)
+    rand_seg = torch.rand(bsz, device=device, generator=generator)
+    drop_depth_ind = rand_depth < p_depth
+    drop_seg_ind = rand_seg < p_seg
+
+    eff_drop_depth = torch.where(
+        keep_all,
+        torch.zeros_like(drop_depth_ind),
+        torch.where(drop_all, torch.ones_like(drop_depth_ind), drop_depth_ind),
+    )
+    eff_drop_seg = torch.where(
+        keep_all,
+        torch.zeros_like(drop_seg_ind),
+        torch.where(drop_all, torch.ones_like(drop_seg_ind), drop_seg_ind),
+    )
+
+    keep_depth = (~eff_drop_depth).to(dtype=weight_dtype).reshape(bsz, 1, 1, 1)
+    keep_seg = (~eff_drop_seg).to(dtype=weight_dtype).reshape(bsz, 1, 1, 1)
+    controlnet_image_before_depth = controlnet_image_before_depth * keep_depth
+    controlnet_image_before_seg = controlnet_image_before_seg * keep_seg
+
+    return encoder_hidden_states, controlnet_image_before_depth, controlnet_image_before_seg
+
+
 def run_epoch(
     unet: UNet2DConditionModel,
     vae: AutoencoderKL,
@@ -165,47 +449,41 @@ def run_epoch(
                 # 4. 文本条件
                 encoder_hidden_states = text_encoder(batch["input_ids"])[0]
 
-                # 5. 原始图像 latent（mode）
-                original_image_embeds = vae.encode(batch["original_pixel_values"].to(weight_dtype)).latent_dist.mode()
-
-                # 6. 条件 dropout (classifier-free guidance 支持)
-                if data_cfg.get("conditioning_dropout_prob") is not None:
-                    random_p = torch.rand(bsz, device=latents.device, generator=generator)
-                    prompt_mask = random_p < 2 * data_cfg.get("conditioning_dropout_prob")
-                    prompt_mask = prompt_mask.reshape(bsz, 1, 1)
-                    null_inputs = tokenizer(
-                        [""],
-                        max_length=tokenizer.model_max_length,
-                        padding="max_length",
-                        truncation=True,
-                        return_tensors="pt",
-                    )
-                    null_conditioning = text_encoder(null_inputs.input_ids.to(accelerator.device))[0]
-                    encoder_hidden_states = torch.where(prompt_mask, null_conditioning, encoder_hidden_states)
-
-                    image_mask_dtype = original_image_embeds.dtype
-                    image_mask = 1 - (
-                        (random_p >= data_cfg.get("conditioning_dropout_prob")).to(image_mask_dtype)
-                        * (random_p < 3 * data_cfg.get("conditioning_dropout_prob")).to(image_mask_dtype)
-                    )
-                    image_mask = image_mask.reshape(bsz, 1, 1, 1)
-                    original_image_embeds = image_mask * original_image_embeds
-
-                # 7. 拼接 Unet 输入 image latent 与 noisy latent
-                concatenated_noisy_latents = torch.cat([noisy_latents, original_image_embeds], dim=1)
-
-                # 8. 拼接 T2I Adapter 输入
+                # 5. 控制图像
                 controlnet_image_before_depth = (
                     batch["before_depth_pixel_values"].to(dtype=weight_dtype).repeat(1, 3, 1, 1)
-                )  # [bs, 3, h, w]
-                controlnet_image_before_seg = batch["before_seg_pixel_values"].to(dtype=weight_dtype)  # [bs, 3, h, w]
+                )  # [B, 3, H, W]
+                controlnet_image_before_seg = batch["before_seg_pixel_values"].to(dtype=weight_dtype)  # [B, 3, H, W]
 
-                # 将两种输入进行拼接
+                # 6. 原始图像 latent（mode）
+                original_image_embeds = vae.encode(batch["original_pixel_values"].to(weight_dtype)).latent_dist.mode()
+
+                # 7. 条件 dropout 策略
+                encoder_hidden_states, controlnet_image_before_depth, controlnet_image_before_seg = (
+                    apply_text_and_cond_dropout(
+                        encoder_hidden_states=encoder_hidden_states,
+                        controlnet_image_before_depth=controlnet_image_before_depth,
+                        controlnet_image_before_seg=controlnet_image_before_seg,
+                        tokenizer=tokenizer,
+                        text_encoder=text_encoder,
+                        data_cfg=data_cfg,
+                        bsz=bsz,
+                        device=latents.device,
+                        weight_dtype=weight_dtype,
+                        accelerator=accelerator,
+                        generator=generator,
+                    )
+                )
+
+                # 8. 拼接 Unet 输入 image latent 与 noisy latent
+                concatenated_noisy_latents = torch.cat([noisy_latents, original_image_embeds], dim=1)
+
+                # 9. 输入条件图像拼接
                 t2iadapter_image = torch.cat(
                     [controlnet_image_before_depth, controlnet_image_before_seg], dim=1
                 )  # [bs, 6, h, w]
 
-                # 9. 确定监督目标
+                # 10. 确定监督目标
                 if noise_scheduler.config.prediction_type == "epsilon":
                     target = noise
                 elif noise_scheduler.config.prediction_type == "v_prediction":
@@ -213,7 +491,7 @@ def run_epoch(
                 else:
                     raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
 
-                # 10. 前向 + loss
+                # 11. 前向 + loss
                 # TODO: 目前 T2Iadapter 只支持单种条件，暂时用深度条件
                 down_block_additional_residuals = adapter(controlnet_image_before_depth)
                 # NOTE:
@@ -232,13 +510,13 @@ def run_epoch(
 
                 loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 
-            # 11. 分布式收集用于日志（保持与原实现一致）
+            # 12. 分布式收集用于日志（保持与原实现一致）
             avg_loss = accelerator.gather(loss.repeat(train_cfg.get("train_batch_size"))).mean()
             # 不在这里做除法，保持真实求和；最后一个不完整累计组只除以实际 micro_count
             accum_loss_sum += avg_loss.item()
             micro_count += 1
 
-            # 12. 反向与优化
+            # 13. 反向与优化
             accelerator.backward(loss)
             if accelerator.sync_gradients:
                 accelerator.clip_grad_norm_(
@@ -249,7 +527,7 @@ def run_epoch(
                 lr_scheduler.step()
             optimizer.zero_grad()
 
-        # 13. 若完成一次优化（梯度已同步）
+        # 14. 若完成一次优化（梯度已同步）
         if accelerator.sync_gradients:
             if model_cfg.get("use_ema"):
                 if ema_unet is not None:
@@ -459,53 +737,13 @@ def main():
         model = model._orig_mod if is_compiled_module(model) else model
         return model
 
-    # `accelerate` 0.16.0 will have better support for customized saving
-    if version.parse(accelerate.__version__) >= version.parse("0.16.0"):
-        # create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format
-        def save_model_hook(models, weights, output_dir):
-            if accelerator.is_main_process:
-                if model_cfg.get("use_ema"):
-                    ema_unet.save_pretrained(os.path.join(output_dir, "unet_ema"))
-                    ema_adapter.save_pretrained(os.path.join(output_dir, "t2iadapter_ema"))
-
-                # models 里顺序：unet, adapter （accelerator.prepare 顺序）
-                for i, model in enumerate(models):
-                    sub_dir = "unet" if isinstance(model, UNet2DConditionModel) else "t2iadapter"
-                    model.save_pretrained(os.path.join(output_dir, sub_dir))
-
-                    # make sure to pop weight so that corresponding model is not saved again
-                    if weights:
-                        weights.pop()
-
-        def load_model_hook(models, input_dir):
-            if model_cfg.get("use_ema"):
-                load_unet_ema = EMAModel.from_pretrained(os.path.join(input_dir, "unet_ema"), UNet2DConditionModel)
-                ema_unet.load_state_dict(load_unet_ema.state_dict())
-                ema_unet.to(accelerator.device)
-                del load_unet_ema
-                if os.path.isdir(os.path.join(input_dir, "t2iadapter_ema")):
-                    load_adapter_ema = EMAModel.from_pretrained(os.path.join(input_dir, "t2iadapter_ema"))
-                    ema_adapter.load_state_dict(load_adapter_ema.state_dict())
-                    ema_adapter.to(accelerator.device)
-                    del load_adapter_ema
-
-            for i in range(len(models)):
-                # pop models so that they are not loaded again
-                model = models.pop()
-
-                # load diffusers style into model
-                if isinstance(model, UNet2DConditionModel):
-                    load_unet_model = UNet2DConditionModel.from_pretrained(input_dir, subfolder="unet")
-                    model.register_to_config(**load_unet_model.config)
-                    model.load_state_dict(load_unet_model.state_dict())
-                    del load_unet_model
-                else:  # adapter
-                    load_adapter_model = T2IAdapter.from_pretrained(os.path.join(input_dir, "t2iadapter"))
-                    model.load_state_dict(load_adapter_model.state_dict())
-                    del load_adapter_model
-
-        accelerator.register_save_state_pre_hook(save_model_hook)
-        accelerator.register_load_state_pre_hook(load_model_hook)
+    # 注册保存/加载 hooks
+    register_accelerator_saveload_hooks(
+        accelerator,
+        model_cfg,
+        ema_unet if model_cfg.get("use_ema") else None,
+        ema_adapter if model_cfg.get("use_ema") else None,
+    )
 
     if train_cfg.get("gradient_checkpointing"):
         unet.enable_gradient_checkpointing()
@@ -536,7 +774,6 @@ def main():
 
     # 需要训练的参数集合：UNet + Adapter
     params_to_optimize = list(unet.parameters()) + list(adapter.parameters())
-
     optimizer = optimizer_cls(
         params_to_optimize,
         lr=learning_rate,
@@ -545,75 +782,28 @@ def main():
         eps=opt_cfg.get("adam_epsilon"),
     )
 
-    # Create dataset using the custom ImageEditDataset class
-
-    with accelerator.main_process_first():
-        # Create training dataset
-        train_dataset = ImageEditDataset(
-            dataset_path=data_cfg.get("dataset_path"),
-            tokenizer=tokenizer,
-            resolution=data_cfg.get("resolution"),
-            split="train",
-            center_crop=data_cfg.get("center_crop"),
-            random_flip=data_cfg.get("random_flip"),
-            max_samples=train_cfg.get("max_train_samples"),
-            seed=seed,
-            use_fixed_edit_text=data_cfg.get("use_fixed_edit_text"),
-        )
-
-        # Create validation dataset for visualization
-        val_dataset = ImageEditDataset(
-            dataset_path=data_cfg.get("dataset_path"),
-            tokenizer=tokenizer,
-            resolution=data_cfg.get("resolution"),
-            split="test",
-            center_crop=False,
-            random_flip=False,
-            max_samples=10,  # 限制验证样本数量
-            seed=seed,
-            use_fixed_edit_text=data_cfg.get("use_fixed_edit_text", False),
-        )
-
-    # DataLoaders creation:
-    train_dataloader = torch.utils.data.DataLoader(
-        train_dataset,
-        shuffle=True,
-        collate_fn=collate_fn,
-        batch_size=train_cfg.get("train_batch_size"),
-        num_workers=data_cfg.get("dataloader_num_workers"),
-        # drop_last=True,
+    # 构建数据集和 DataLoader
+    train_dataset, val_dataset, train_dataloader = prepare_datasets_and_dataloader(
+        data_cfg, train_cfg, tokenizer, accelerator, seed
     )
 
     # Scheduler and math around the number of training steps.
     # Check the PR https://github.com/huggingface/diffusers/pull/8312 for detailed explanation.
-    num_warmup_steps_for_scheduler = sched_cfg.get("lr_warmup_steps") * accelerator.num_processes
-    max_train_steps = train_cfg.get("max_train_steps")
-    if max_train_steps is None:
-        len_train_dataloader_after_sharding = math.ceil(len(train_dataloader) / accelerator.num_processes)
-        num_update_steps_per_epoch = math.ceil(
-            len_train_dataloader_after_sharding / train_cfg.get("gradient_accumulation_steps")
-        )
-        num_training_steps_for_scheduler = (
-            train_cfg.get("num_train_epochs") * num_update_steps_per_epoch * accelerator.num_processes
-        )
-    else:
-        num_training_steps_for_scheduler = max_train_steps * accelerator.num_processes
-
-    if sched_cfg.get("lr_scheduler") == "plateau":
-        lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer,
-            mode="min",
-            factor=sched_cfg.get("plateau_factor"),
-            patience=sched_cfg.get("plateau_patience"),
-            min_lr=sched_cfg.get("min_lr"),
-        )
-    else:
-        lr_scheduler = get_scheduler(
-            sched_cfg.get("lr_scheduler"),
-            optimizer=optimizer,
-            num_warmup_steps=num_warmup_steps_for_scheduler,
-            num_training_steps=num_training_steps_for_scheduler,
-        )
+    (
+        lr_scheduler,
+        num_warmup_steps_for_scheduler,
+        num_training_steps_for_scheduler,
+        max_train_steps,
+        len_train_dataloader_after_sharding,
+        _num_update_steps_per_epoch_pre_unused,
+    ) = setup_lr_scheduler_and_steps(
+        sched_cfg=sched_cfg,
+        train_cfg=train_cfg,
+        accelerator=accelerator,
+        optimizer=optimizer,
+        train_dataloader=train_dataloader,
+        max_train_steps_cfg=train_cfg.get("max_train_steps"),
+    )
 
     # Prepare everything with our `accelerator`.
     unet, adapter, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
@@ -666,42 +856,15 @@ def main():
     accelerator.print(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
     accelerator.print(f"  Gradient Accumulation steps = {train_cfg.get('gradient_accumulation_steps')}")
     accelerator.print(f"  Total optimization steps = {max_train_steps}")
-    global_step = 0
-    first_epoch = 0
 
     # Epoch-based resume: look for checkpoint-epoch-* only
-    resume_from_checkpoint = train_cfg.get("resume_from_checkpoint")
-    if resume_from_checkpoint:
-        if resume_from_checkpoint == "latest":
-            dirs = [d for d in os.listdir(output_dir) if d.startswith("checkpoint-epoch-")]
-            dirs = sorted(dirs, key=lambda x: int(x.split("-epoch-")[1]))
-            latest = dirs[-1] if dirs else None
-            if latest is None:
-                accelerator.print("No epoch checkpoint found, starting fresh.")
-            else:
-                epoch_num = int(latest.split("-epoch-")[1])
-                accelerator.print(f"Resuming from epoch checkpoint {latest}")
-                accelerator.load_state(os.path.join(output_dir, latest))
-                first_epoch = epoch_num  # 继续该 epoch（已完成的 epoch 数=epoch_num）
-                global_step = epoch_num * num_update_steps_per_epoch
-        else:
-            # Provided path could be absolute or relative; extract epoch number
-            base = os.path.basename(resume_from_checkpoint.rstrip("/"))
-            if base.startswith("checkpoint-epoch-"):
-                epoch_num = int(base.split("-epoch-")[1])
-                if os.path.isdir(resume_from_checkpoint):
-                    load_dir = resume_from_checkpoint
-                else:
-                    load_dir = os.path.join(output_dir, base)
-                if not os.path.isdir(load_dir):
-                    accelerator.print(f"Checkpoint directory {load_dir} not found; starting fresh.")
-                else:
-                    accelerator.print(f"Resuming from epoch checkpoint {load_dir}")
-                    accelerator.load_state(load_dir)
-                    first_epoch = epoch_num
-                    global_step = epoch_num * num_update_steps_per_epoch
-            else:
-                accelerator.print(f"Provided resume path {resume_from_checkpoint} is not an epoch checkpoint; ignored.")
+    # 恢复 epoch 级 checkpoint
+    first_epoch, global_step = maybe_resume_epoch_checkpoint(
+        accelerator=accelerator,
+        output_dir=output_dir,
+        train_cfg=train_cfg,
+        num_update_steps_per_epoch=num_update_steps_per_epoch,
+    )
 
     for epoch in range(first_epoch, num_train_epochs):
         progress_bar = tqdm(
