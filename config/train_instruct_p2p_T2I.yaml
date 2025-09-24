@@ -12,7 +12,8 @@ model:
   use_ema: true
   # ---- T2I Adapter ----
   t2i_adapter_path: null # 预训练 adapter 路径（为空则随机初始化）
-  t2i_adapter_in_channels: 3 # adapter 输入通道（这里使用 depth(3) + seg(3)）  # TODO: 目前只支持一种条件
+  # TODO: 目前只支持一种条件
+  t2i_adapter_in_channels: 3 # adapter 输入通道（这里使用 depth(3) + seg(3)）
   t2i_adapter_type: "full_adapter" # full_adapter 或 light_adapter
   t2i_adapter_channels: [320, 640, 1280, 1280] # 通道需与 Stable Diffusion v2.1 UNet 层级对齐，避免 residual 加和时报 320 vs 640 维度不匹配
   t2i_adapter_num_res_blocks: 2 # 每层 residual blocks 数量
@@ -29,6 +30,9 @@ training:
   validation_epochs: 1
   resume_from_checkpoint: "latest"
   checkpoints_total_limit: 5
+  # 时间步采样策略："uniform"（默认）或 "cubic"
+  # cubic 参考 InstructPix2Pix 论文 3.4 节：timesteps = (1 - u^3) * T
+  timestep_sampling: "cubic"
 
 optimizer:
   learning_rate: 1.0e-4

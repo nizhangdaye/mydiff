@@ -436,12 +436,26 @@ def run_epoch(
                 # 2. 采样噪声与时间步
                 noise = torch.randn_like(latents)
                 bsz = latents.shape[0]
-                timesteps = torch.randint(
-                    0,
-                    noise_scheduler.config.num_train_timesteps,
-                    (bsz,),
-                    device=latents.device,
-                ).long()
+                # 采样策略：默认 uniform，可在配置 training.timestep_sampling 设为 "cubic"
+                sampling_mode = train_cfg.get("timestep_sampling", "uniform")
+                if sampling_mode == "cubic":
+                    # Cubic sampling to sample a random timestep for each image.
+                    # For more details about why cubic sampling is used, refer to section 3.4 of
+                    # https://huggingface.co/papers/2302.08453
+                    # 使用与其一致的公式：(1 - (t/T)^3) * T，并确保类型与范围匹配
+                    timesteps = torch.rand((bsz,), device=latents.device)
+                    timesteps = (1 - timesteps**3) * noise_scheduler.config.num_train_timesteps
+                    # 将浮点转换为整型时间步，并匹配 scheduler 的 dtype
+                    timesteps = timesteps.long().to(noise_scheduler.timesteps.dtype)
+                    timesteps = timesteps.clamp(0, noise_scheduler.config.num_train_timesteps - 1)
+                else:
+                    # uniform 整数采样
+                    timesteps = torch.randint(
+                        0,
+                        noise_scheduler.config.num_train_timesteps,
+                        (bsz,),
+                        device=latents.device,
+                    ).long()
 
                 # 3. 前向扩散：向 latent 加噪
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
