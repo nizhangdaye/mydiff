@@ -901,6 +901,7 @@ def main():
         progress_bar.close()
 
         # 按 epoch 保存（若启用）
+        accelerator.wait_for_everyone()
         if accelerator.is_main_process and ckpt_cfg.get("checkpoint_epochs"):
             if (epoch + 1) % ckpt_cfg.get("checkpoint_epochs") == 0:
                 # checkpoint 轮换
@@ -932,6 +933,7 @@ def main():
 
         # ========== 最优模型保存逻辑 (基于 epoch 平均 loss) ==========
         # 在主进程比较并保存最优 checkpoint (含状态)。
+        accelerator.wait_for_everyone()
         if accelerator.is_main_process and not math.isnan(epoch_avg_loss):
             # 使用属性缓存 best
             if not hasattr(main, "_best_epoch_loss"):
@@ -978,6 +980,9 @@ def main():
 
                 del pipeline
                 torch.cuda.empty_cache()
+
+        # 验证结束后再次同步，确保所有进程同时继续下一轮训练，防止 NCCL 广播/规约等待超时
+        accelerator.wait_for_everyone()
 
         if global_step >= max_train_steps:
             break
