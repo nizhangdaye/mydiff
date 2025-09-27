@@ -66,6 +66,7 @@ def load_model(model_cfg: dict, accelerator: Accelerator):
         subfolder="unet",
         use_safetensors=False,
     )
+    # TODO: 如果有多种条件，需要并行 adapter，可以调用 MultiAdapter 进行管理
     if model_cfg.get("t2i_adapter_path"):
         accelerator.print(f"Loading T2IAdapter from {model_cfg.get('t2i_adapter_path')}")
         adapter = T2IAdapter.from_pretrained(model_cfg.get("t2i_adapter_path"))
@@ -525,7 +526,7 @@ def run_epoch(
                 loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 
             # 12. 分布式收集用于日志（保持与原实现一致）
-            avg_loss = accelerator.gather(loss.repeat(train_cfg.get("train_batch_size"))).mean()
+            avg_loss = accelerator.gather(loss).mean()
             # 不在这里做除法，保持真实求和；最后一个不完整累计组只除以实际 micro_count
             accum_loss_sum += avg_loss.item()
             micro_count += 1
@@ -915,7 +916,6 @@ def main():
         progress_bar.close()
 
         # 按 epoch 保存（若启用）
-        accelerator.wait_for_everyone()
         if accelerator.is_main_process and ckpt_cfg.get("checkpoint_epochs"):
             if (epoch + 1) % ckpt_cfg.get("checkpoint_epochs") == 0:
                 # checkpoint 轮换
@@ -947,7 +947,6 @@ def main():
 
         # ========== 最优模型保存逻辑 (基于 epoch 平均 loss) ==========
         # 在主进程比较并保存最优 checkpoint (含状态)。
-        accelerator.wait_for_everyone()
         if accelerator.is_main_process and not math.isnan(epoch_avg_loss):
             # 使用属性缓存 best
             if not hasattr(main, "_best_epoch_loss"):
@@ -955,13 +954,14 @@ def main():
             if epoch_avg_loss < main._best_epoch_loss:  # type: ignore
                 prev = getattr(main, "_best_epoch_loss")
                 main._best_epoch_loss = float(epoch_avg_loss)  # type: ignore
-                best_dir = os.path.join(output_dir, "checkpoint-best")
-                # 若存在旧 best，可先删除（保持单一目录）
-                if os.path.isdir(best_dir):
-                    try:
-                        shutil.rmtree(best_dir)
-                    except Exception as e:  # pragma: no cover
-                        accelerator.print(f"Failed removing old best checkpoint dir: {e}")
+                # 删除旧的 best_* 目录（只保留一个 best checkpoint）
+                for d in os.listdir(output_dir):
+                    if d.startswith("best_"):
+                        try:
+                            shutil.rmtree(os.path.join(output_dir, d))
+                        except Exception as e:
+                            accelerator.print(f"Failed removing old best checkpoint dir {d}: {e}")
+                best_dir = os.path.join(output_dir, f"best_{epoch + 1}")
                 accelerator.save_state(best_dir)
                 accelerator.print(
                     f"[Best Model] Epoch {epoch} new best loss {epoch_avg_loss:.6f} (prev {prev:.6f}). Saved to {best_dir}"
