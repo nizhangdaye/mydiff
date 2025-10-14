@@ -15,6 +15,7 @@ except Exception:  # pragma: no cover
     T2IAdapter = Any  # type: ignore
 
 
+# TODO: 可以继承自 StableDiffusionAdapterPipeline
 class InstructPix2PixT2IAdapterPipeline(StableDiffusionInstructPix2PixPipeline):
     """融合 InstructPix2Pix 与 T2I-Adapter 的推理管道。
 
@@ -59,7 +60,7 @@ class InstructPix2PixT2IAdapterPipeline(StableDiffusionInstructPix2PixPipeline):
             image_encoder=image_encoder,
             requires_safety_checker=requires_safety_checker,
         )
-        self.adapter = adapter
+        self.adapter = adapter.to("cuda")
         self.register_modules(adapter=adapter)
 
     @torch.no_grad()
@@ -150,9 +151,8 @@ class InstructPix2PixT2IAdapterPipeline(StableDiffusionInstructPix2PixPipeline):
         # 6. Adapter forward -> residuals 列表 (按照 StableDiffusionAdapterPipeline 约定顺序)
         # adapter 期望原始 RGB (归一化后) 输入，image_processor 输出范围在 [-1,1]
         adapter_residuals = self.adapter(adapter_tensor.to(device=device, dtype=prompt_embeds.dtype))
-        # 允许整体缩放
-        if adapter_scale != 1.0:
-            adapter_residuals = [r * adapter_scale for r in adapter_residuals]
+        for k, v in enumerate(adapter_residuals):
+            adapter_residuals[k] = v * adapter_scale
 
         # 7. 去噪循环
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
@@ -169,7 +169,7 @@ class InstructPix2PixT2IAdapterPipeline(StableDiffusionInstructPix2PixPipeline):
                     unet_input,
                     t,
                     encoder_hidden_states=prompt_embeds,
-                    down_intrablock_additional_residuals=adapter_residuals,
+                    down_intrablock_additional_residuals=[state.clone() for state in adapter_residuals],
                     mid_block_additional_residual=None,
                     cross_attention_kwargs=cross_attention_kwargs,
                     return_dict=False,

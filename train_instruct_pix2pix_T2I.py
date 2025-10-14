@@ -726,6 +726,9 @@ def main():
         print(yaml.dump(cfg, allow_unicode=True, sort_keys=False))
         if output_dir is not None:
             os.makedirs(output_dir, exist_ok=True)
+        # 保存配置文件
+        with open(os.path.join(output_dir, "config.yaml"), "w", encoding="utf-8") as f:
+            yaml.safe_dump(cfg, f, allow_unicode=True, sort_keys=False)
 
     # Load scheduler, tokenizer and models.
     noise_scheduler, tokenizer, text_encoder, vae, unet, adapter = load_model(model_cfg, accelerator)
@@ -796,6 +799,7 @@ def main():
         weight_decay=opt_cfg.get("adam_weight_decay"),
         eps=opt_cfg.get("adam_epsilon"),
     )
+    total_trainable_params = sum(p.numel() for p in optimizer.param_groups[0]["params"] if p.requires_grad)
 
     # 构建数据集和 DataLoader
     train_dataset, val_dataset, train_dataloader = prepare_datasets_and_dataloader(
@@ -871,6 +875,7 @@ def main():
     accelerator.print(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
     accelerator.print(f"  Gradient Accumulation steps = {train_cfg.get('gradient_accumulation_steps')}")
     accelerator.print(f"  Total optimization steps = {max_train_steps}")
+    accelerator.print(f"Total trainable parameters in optimizer: {total_trainable_params / 1024 / 1024:.4f} M")
 
     # Epoch-based resume: look for checkpoint-epoch-* only
     # 恢复 epoch 级 checkpoint

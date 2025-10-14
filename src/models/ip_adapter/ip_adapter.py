@@ -13,7 +13,7 @@ from diffusers.configuration_utils import register_to_config
 from diffusers.models.attention_processor import IPAdapterAttnProcessor2_0
 from diffusers.models.embeddings import MultiIPAdapterImageProjection
 from torch import nn
-from transformers import CLIPTextModel, CLIPVisionModelWithProjection
+from transformers import AutoProcessor, CLIPTextModel, CLIPVisionModelWithProjection
 
 from diffusers import AutoencoderKL, StableDiffusionInstructPix2PixPipeline, UNet2DConditionModel
 from diffusers.utils import USE_PEFT_BACKEND, BaseOutput, deprecate, logging, scale_lora_layers, unscale_lora_layers

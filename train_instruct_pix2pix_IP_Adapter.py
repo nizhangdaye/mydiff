@@ -8,6 +8,7 @@ from typing import Any, Dict, List
 
 import accelerate
 import datasets
+import matplotlib.cm as cm
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -24,7 +25,7 @@ from torch import nn
 from torch.utils.data import DataLoader
 from torchvision import transforms
 from tqdm.auto import tqdm
-from transformers import CLIPTextModel, CLIPTokenizer, CLIPVisionModelWithProjection
+from transformers import CLIPImageProcessor, CLIPTextModel, CLIPTokenizer, CLIPVisionModelWithProjection
 
 import diffusers
 from diffusers import (
@@ -63,6 +64,9 @@ def load_model(model_cfg: dict, accelerator: Accelerator):
         model_cfg["pretrained_model_name_or_path"],
         subfolder="image_encoder",
     )
+    image_processor = CLIPImageProcessor.from_pretrained(
+        model_cfg["pretrained_model_name_or_path"], subfolder="feature_extractor"
+    )
     vae = AutoencoderKL.from_pretrained(
         model_cfg["pretrained_model_name_or_path"],
         subfolder="vae",
@@ -74,7 +78,7 @@ def load_model(model_cfg: dict, accelerator: Accelerator):
     )
     ipadapter_unet = IPAdapterUNet2DConditionModel.from_unet(unet)
 
-    return noise_scheduler, tokenizer, text_encoder, image_encoder, vae, unet, ipadapter_unet
+    return noise_scheduler, tokenizer, text_encoder, image_encoder, image_processor, vae, unet, ipadapter_unet
 
 
 def register_accelerator_saveload_hooks(
@@ -357,6 +361,7 @@ def apply_text_and_cond_dropout(
 def run_epoch(
     instruct_p2p_ipadapter_unet,
     image_encoder,
+    image_processor: CLIPImageProcessor,
     vae: AutoencoderKL,
     text_encoder: CLIPTextModel,
     tokenizer: CLIPTokenizer,
@@ -464,10 +469,20 @@ def run_epoch(
                 #     [controlnet_image_before_depth, controlnet_image_before_seg], dim=1
                 # )  # [bs, 6, h, w]
                 with torch.no_grad():
-                    vision_out = image_encoder(
-                        controlnet_image_before_depth.to(accelerator.device, dtype=weight_dtype),
-                        output_hidden_states=True,
-                    )
+                    # 使用 CLIPImageProcessor 进行规范预处理
+                    # 将类别索引缩放到 [0,1]，再交给 processor（其会做 resize/center_crop/normalize 等）
+                    classes = controlnet_image_before_depth.to(accelerator.device, dtype=torch.float32)
+                    denom = torch.clamp(classes.amax(dim=(1, 2, 3), keepdim=True), min=1.0)
+                    img_01 = classes / denom  # [0,1]
+                    # processor 期望输入 [0, 255] 或 PIL；这里将 [0,1] 转到 [0,255] 并按 B,C,H,W -> B,H,W,C 再转 PIL
+                    imgs_pil = []
+                    for b in range(img_01.shape[0]):
+                        arr = (img_01[b].clamp(0, 1) * 255.0).to(torch.uint8).permute(1, 2, 0).cpu().numpy()
+                        imgs_pil.append(Image.fromarray(arr))
+                    processed = image_processor(images=imgs_pil, return_tensors="pt")
+                    pixel_values = processed["pixel_values"].to(accelerator.device, dtype=weight_dtype)
+
+                    vision_out = image_encoder(pixel_values, output_hidden_states=True)
                     ip_adapter_image_embeds = vision_out.last_hidden_state
                     ip_adapter_image_embeds = ip_adapter_image_embeds.unsqueeze(1)  # (B, 1, 257, hidden)
 
@@ -629,6 +644,10 @@ def log_validation(
                 before_depth_tensor.unsqueeze(0),  # (1,3,H,W)
                 target_size=224,
             )  # (1,3,224,224)
+            # 为与训练/CLIP 预处理一致：将类别索引缩放到 [0,1]，交由 pipeline 的 image_processor 做进一步标准化
+            ip_adapter_image_for_embed = ip_adapter_image
+            denom = torch.clamp(ip_adapter_image_for_embed.amax(dim=(1, 2, 3), keepdim=True), min=1.0)
+            ip_adapter_image_for_embed = (ip_adapter_image_for_embed / denom).clamp(0, 1)
             # # 送入 image_encoder 得到嵌入 (与训练 run_epoch 第 9 步一致)
             # with torch.no_grad():
             #     vision_out = pipeline.image_encoder(
@@ -643,7 +662,7 @@ def log_validation(
             edited = pipeline(
                 prompt=edit_instruction,
                 image=before_image,
-                ip_adapter_image=[ip_adapter_image],
+                ip_adapter_image=[ip_adapter_image_for_embed],
                 num_inference_steps=inference_steps,
                 generator=generator,
                 guidance_scale=guidance_scale,
@@ -651,14 +670,33 @@ def log_validation(
                 depth_thresholds=depth_thresholds,
             ).images[0]
 
-            # 可视化拼图: before | gt(after) | depth | seg | edited
+            # 可视化拼图: before | gt(after) | depth | seg | edited | simple_multi_threshold(depth)
             vis_w, vis_h = before_image.size
             grid = Image.new("RGB", (vis_w * 3, vis_h * 2), (255, 255, 255))
+            # 第一行
             grid.paste(before_image, (0, 0))
             grid.paste(after_image, (vis_w, 0))
             grid.paste(before_depth_img, (vis_w * 2, 0))
+            # 第二行前两列
             grid.paste(before_seg_img.convert("RGB"), (0, vis_h))
             grid.paste(edited, (vis_w, vis_h))
+            # 第二行第三列: 展示 simple_multi_threshold 的离散分类图（使用 tab10 调色板着色）
+            # ip_adapter_image 形状为 (1, 3, target_size, target_size)，通道内容相同，取单通道类别索引
+            cls_map = ip_adapter_image[0, 0].detach().cpu().numpy()
+            cls_map = cls_map.astype(np.int32)
+            num_classes = int(cls_map.max()) + 1
+            num_classes = max(1, num_classes)
+
+            # 采用 tab10 调色板，确保至少有 num_classes 个颜色
+            cmap = cm.get_cmap("tab10", max(10, num_classes))
+            palette = cmap(np.arange(max(10, num_classes)))  # (K,4) RGBA in [0,1]
+
+            # 依据类别索引直接查表着色
+            color_img = palette[cls_map][..., :3]  # (H,W,3)
+            color_img = (color_img * 255).astype(np.uint8)
+
+            ip_vis_img = Image.fromarray(color_img, mode="RGB").resize((vis_w, vis_h), Image.NEAREST)
+            grid.paste(ip_vis_img, (vis_w * 2, vis_h))
 
             if accelerator.is_main_process:
                 grid.save(os.path.join(save_dir, f"sample_{idx}.png"))
@@ -755,6 +793,7 @@ def main():
         tokenizer,
         text_encoder,
         image_encoder,
+        image_processor,
         vae,
         unet,
         instruct_p2p_ipadapter_unet,
@@ -922,6 +961,7 @@ def main():
         epoch_avg_loss, global_step = run_epoch(
             instruct_p2p_ipadapter_unet=instruct_p2p_ipadapter_unet,
             image_encoder=image_encoder,
+            image_processor=image_processor,
             vae=vae,
             text_encoder=text_encoder,
             tokenizer=tokenizer,
@@ -1011,7 +1051,7 @@ def main():
                     unet=unwrap_model(instruct_p2p_ipadapter_unet),
                     safety_checker=None,
                     requires_safety_checker=False,
-                    feature_extractor=None,
+                    feature_extractor=image_processor,
                 )
 
                 log_validation(pipeline, cfg, accelerator, generator, epoch, val_dataset)
@@ -1043,7 +1083,7 @@ def main():
             unet=unwrap_model(instruct_p2p_ipadapter_unet),
             safety_checker=None,
             requires_safety_checker=False,
-            feature_extractor=None,
+            feature_extractor=image_processor,
         )
         pipeline.save_pretrained(output_dir)
 
