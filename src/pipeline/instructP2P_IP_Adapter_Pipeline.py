@@ -123,17 +123,17 @@ class InstructPix2PixIpAdapterPipeline(StableDiffusionInstructPix2PixPipeline):
         )
 
         # ==============================
-        # 3. 处理 IP-Adapter 图像嵌入（可选）
+        # 3. 处理 IP-Adapter 图像嵌入（可选）  U_net 内部处理
         # ==============================
         # IP-Adapter 是一种通过额外图像提供风格/内容引导的机制
-        if ip_adapter_image is not None or ip_adapter_image_embeds is not None:
-            ip_adapter_image_embeds = self.prepare_ip_adapter_image_embeds(
-                ip_adapter_image,
-                ip_adapter_image_embeds,
-                device,
-                batch_size * num_images_per_prompt,
-                self.do_classifier_free_guidance,
-            )
+        # if ip_adapter_image is not None or ip_adapter_image_embeds is not None:
+        #     ip_adapter_image_embeds = self.prepare_ip_adapter_image_embeds(
+        #         ip_adapter_image,
+        #         ip_adapter_image_embeds,
+        #         device,
+        #         batch_size * num_images_per_prompt,
+        #         self.do_classifier_free_guidance,
+        #     )
 
         # ==============================
         # 4. 预处理输入图像（用于 img2img 或 pix2pix 类任务）
@@ -181,6 +181,21 @@ class InstructPix2PixIpAdapterPipeline(StableDiffusionInstructPix2PixPipeline):
             generator,
             latents,  # 若提供，则直接使用；否则生成新噪声
         )
+
+        # ==============================
+        # 7.5 对齐 IP-Adapter 语义图的 batch（一次性，避免在循环中重复）
+        # ==============================
+        # 目标 batch：若启用 CFG(三分支)，则为 3x；否则为原始 batch
+        if isinstance(ip_adapter_image, torch.Tensor):
+            target_batch = latents.shape[0] * (3 if self.do_classifier_free_guidance else 1)
+            current_batch = ip_adapter_image.shape[0]
+            if current_batch != target_batch:
+                if target_batch % current_batch != 0:
+                    raise ValueError(
+                        f"ip_adapter_image batch={current_batch} 与模型输入 batch={target_batch} 不兼容，无法对齐。"
+                    )
+                repeat_factor = target_batch // current_batch
+                ip_adapter_image = ip_adapter_image.repeat_interleave(repeat_factor, dim=0)
 
         # ==============================
         # 8. 验证 UNet 输入通道数是否匹配
@@ -234,7 +249,7 @@ class InstructPix2PixIpAdapterPipeline(StableDiffusionInstructPix2PixPipeline):
                     scaled_latent_model_input,
                     t,
                     encoder_hidden_states=prompt_embeds,  # 文本嵌入
-                    ip_adapter_image_embeds=ip_adapter_image_embeds,  # IP-Adapter 嵌入
+                    ip_adapter_semantic_map=ip_adapter_image,  # IP-Adapter 嵌入（已在循环外按 batch 对齐）
                     cross_attention_kwargs=cross_attention_kwargs,
                     return_dict=False,
                 )[0]  # 取第一个输出（噪声预测）

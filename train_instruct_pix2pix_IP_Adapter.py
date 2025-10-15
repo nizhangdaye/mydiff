@@ -360,7 +360,6 @@ def apply_text_and_cond_dropout(
 
 def run_epoch(
     instruct_p2p_ipadapter_unet,
-    image_encoder,
     image_processor: CLIPImageProcessor,
     vae: AutoencoderKL,
     text_encoder: CLIPTextModel,
@@ -437,7 +436,7 @@ def run_epoch(
                 controlnet_image_before_seg = batch["before_seg_pixel_values"].to(dtype=weight_dtype)  # [B, 3, H, W]
                 # TODO: 阈值也可以用一个可学习的参数
                 # 将深度图进行多阈值分割，并裁剪为 244
-                controlnet_image_before_depth = simple_multi_threshold(
+                ip_adapter_depth_semantic_map = simple_multi_threshold(
                     controlnet_image_before_depth, target_size=224, thresholds=[-0.35, 0.15]
                 )
 
@@ -445,10 +444,10 @@ def run_epoch(
                 original_image_embeds = vae.encode(batch["original_pixel_values"].to(weight_dtype)).latent_dist.mode()
 
                 # 7. 条件 dropout 策略
-                encoder_hidden_states, controlnet_image_before_depth, controlnet_image_before_seg = (
+                encoder_hidden_states, ip_adapter_depth_semantic_map, controlnet_image_before_seg = (
                     apply_text_and_cond_dropout(
                         encoder_hidden_states=encoder_hidden_states,
-                        controlnet_image_before_depth=controlnet_image_before_depth,
+                        controlnet_image_before_depth=ip_adapter_depth_semantic_map,
                         controlnet_image_before_seg=controlnet_image_before_seg,
                         tokenizer=tokenizer,
                         text_encoder=text_encoder,
@@ -464,27 +463,10 @@ def run_epoch(
                 # 8. 拼接 Unet 输入 image latent 与 noisy latent
                 concatenated_noisy_latents = torch.cat([noisy_latents, original_image_embeds], dim=1)
 
-                # 9. 输入条件图像拼接
+                # 9. 条件输入：直接传入离散语义/分层深度图，由 UNet 内部 semantic_tokenizer 处理
                 # t2iadapter_image = torch.cat(
                 #     [controlnet_image_before_depth, controlnet_image_before_seg], dim=1
                 # )  # [bs, 6, h, w]
-                with torch.no_grad():
-                    # 使用 CLIPImageProcessor 进行规范预处理
-                    # 将类别索引缩放到 [0,1]，再交给 processor（其会做 resize/center_crop/normalize 等）
-                    classes = controlnet_image_before_depth.to(accelerator.device, dtype=torch.float32)
-                    denom = torch.clamp(classes.amax(dim=(1, 2, 3), keepdim=True), min=1.0)
-                    img_01 = classes / denom  # [0,1]
-                    # processor 期望输入 [0, 255] 或 PIL；这里将 [0,1] 转到 [0,255] 并按 B,C,H,W -> B,H,W,C 再转 PIL
-                    imgs_pil = []
-                    for b in range(img_01.shape[0]):
-                        arr = (img_01[b].clamp(0, 1) * 255.0).to(torch.uint8).permute(1, 2, 0).cpu().numpy()
-                        imgs_pil.append(Image.fromarray(arr))
-                    processed = image_processor(images=imgs_pil, return_tensors="pt")
-                    pixel_values = processed["pixel_values"].to(accelerator.device, dtype=weight_dtype)
-
-                    vision_out = image_encoder(pixel_values, output_hidden_states=True)
-                    ip_adapter_image_embeds = vision_out.last_hidden_state
-                    ip_adapter_image_embeds = ip_adapter_image_embeds.unsqueeze(1)  # (B, 1, 257, hidden)
 
                 # 10. 确定监督目标
                 if noise_scheduler.config.prediction_type == "epsilon":
@@ -501,7 +483,7 @@ def run_epoch(
                     concatenated_noisy_latents,
                     timesteps,
                     encoder_hidden_states,
-                    ip_adapter_image_embeds=[ip_adapter_image_embeds],
+                    ip_adapter_semantic_map=ip_adapter_depth_semantic_map,
                     return_dict=False,
                 )[0]
 
@@ -636,33 +618,25 @@ def log_validation(
             before_seg_img = to_pil(before_seg).resize((resolution, resolution))
 
             # 深度 -> Tensor [-1,1] 期望；若原数据是 0-255，这里归一化
-            before_depth_arr = np.array(before_depth_img)[:, :, 0].astype("float32") / 255.0 * 2.0 - 1.0
-            before_depth_tensor = torch.from_numpy(before_depth_arr).unsqueeze(0).repeat(3, 1, 1)  # (3,H,W)
+            # 已经是 [-1, 1] 了
+            # 若数据集已提供 [-1,1]，直接从 PIL 转 tensor；否则请取消注释进行显式归一化
+            before_depth_tensor = transforms.ToTensor()(before_depth_img)  # (3,H,W) in [0,1] if came from 0-255
+            # 将 [0,1] 拉回到 [-1,1]，与训练期假设一致
+            before_depth_tensor = before_depth_tensor * 2.0 - 1.0
 
             # 通过 simple_multi_threshold 获得参考伪 RGB (与训练一致 224 尺寸 / 244? 使用训练里 target_size=224)
-            ip_adapter_image = simple_multi_threshold(
+            ip_adapter_semantic_map = simple_multi_threshold(
                 before_depth_tensor.unsqueeze(0),  # (1,3,H,W)
                 target_size=224,
             )  # (1,3,224,224)
-            # 为与训练/CLIP 预处理一致：将类别索引缩放到 [0,1]，交由 pipeline 的 image_processor 做进一步标准化
-            ip_adapter_image_for_embed = ip_adapter_image
-            denom = torch.clamp(ip_adapter_image_for_embed.amax(dim=(1, 2, 3), keepdim=True), min=1.0)
-            ip_adapter_image_for_embed = (ip_adapter_image_for_embed / denom).clamp(0, 1)
-            # # 送入 image_encoder 得到嵌入 (与训练 run_epoch 第 9 步一致)
-            # with torch.no_grad():
-            #     vision_out = pipeline.image_encoder(
-            #         reference_clip_images.to(accelerator.device, dtype=pipeline.text_encoder.dtype),
-            #         output_hidden_states=True,
-            #     )
-            # # 构造 [negative, positive] 形式，negative 用 zeros (与 diffusers 逻辑一致)
-            # pos_embeds = vision_out.last_hidden_state  # (1,257,hidden)
-            # neg_embeds = torch.zeros_like(pos_embeds)
-            # ip_adapter_image_embeds = torch.cat([neg_embeds, pos_embeds], dim=0)  # (2,257,hidden)
+
+            # 确保语义图在与模型相同的设备上，避免 CPU/GPU 混用导致的 embedding 报错
+            ip_adapter_semantic_map = ip_adapter_semantic_map.to(accelerator.device)
 
             edited = pipeline(
                 prompt=edit_instruction,
                 image=before_image,
-                ip_adapter_image=[ip_adapter_image_for_embed],
+                ip_adapter_image=ip_adapter_semantic_map,
                 num_inference_steps=inference_steps,
                 generator=generator,
                 guidance_scale=guidance_scale,
@@ -682,7 +656,7 @@ def log_validation(
             grid.paste(edited, (vis_w, vis_h))
             # 第二行第三列: 展示 simple_multi_threshold 的离散分类图（使用 tab10 调色板着色）
             # ip_adapter_image 形状为 (1, 3, target_size, target_size)，通道内容相同，取单通道类别索引
-            cls_map = ip_adapter_image[0, 0].detach().cpu().numpy()
+            cls_map = ip_adapter_semantic_map[0, 0].detach().cpu().numpy()
             cls_map = cls_map.astype(np.int32)
             num_classes = int(cls_map.max()) + 1
             num_classes = max(1, num_classes)
@@ -858,7 +832,7 @@ def main():
         optimizer_cls = torch.optim.AdamW
 
     optimizer = optimizer_cls(
-        instruct_p2p_ipadapter_unet.parameters(),
+        list(instruct_p2p_ipadapter_unet.parameters()),
         lr=learning_rate,
         betas=(opt_cfg.get("adam_beta1"), opt_cfg.get("adam_beta2")),
         weight_decay=opt_cfg.get("adam_weight_decay"),
@@ -907,7 +881,6 @@ def main():
     # Move text_encode and vae to gpu and cast to weight_dtype
     text_encoder.to(accelerator.device, dtype=weight_dtype)
     vae.to(accelerator.device, dtype=weight_dtype)
-    image_encoder.to(accelerator.device, dtype=weight_dtype)
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / train_cfg.get("gradient_accumulation_steps"))
@@ -925,7 +898,7 @@ def main():
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
     if accelerator.is_main_process:
-        accelerator.init_trackers("instruct-pix2pix-ip-adapter")
+        accelerator.init_trackers(log_cfg.get("project_name"))
 
     # Train!
     total_batch_size = (
@@ -960,7 +933,6 @@ def main():
 
         epoch_avg_loss, global_step = run_epoch(
             instruct_p2p_ipadapter_unet=instruct_p2p_ipadapter_unet,
-            image_encoder=image_encoder,
             image_processor=image_processor,
             vae=vae,
             text_encoder=text_encoder,

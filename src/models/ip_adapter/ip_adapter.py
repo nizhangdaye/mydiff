@@ -22,7 +22,7 @@ from diffusers.utils import USE_PEFT_BACKEND, BaseOutput, deprecate, logging, sc
 # from anysd.src.pipe import AnySDInstructPix2PixPipeline
 # from anysd.src.unet import UNet2DConditionAnySD
 from .attention_processor import AttnProcessor2_0
-from .image_proj_model import Resampler
+from .image_proj_model import Resampler, SemanticMapTokenizer
 
 
 @dataclass
@@ -99,6 +99,10 @@ class IPAdapterUNet2DConditionModel(UNet2DConditionModel):
         # ========== IP-Adapter 新增参数 ==========
         num_ip_adapter_image_tokens: Optional[int] = 16,  # 必须提供，
         hidden_size: Optional[int] = 1664,  # image encoder hidden size, 必须提供
+        # ========== 语义 tokenizer 参数（可选） ==========
+        num_semantic_classes: int = 3,
+        tokenizer_patch_size: int = 16,
+        use_sincos_pos_emb: bool = True,
     ):
         super().__init__(
             sample_size=sample_size,
@@ -152,8 +156,19 @@ class IPAdapterUNet2DConditionModel(UNet2DConditionModel):
 
         self.register_to_config(num_ip_adapter_image_tokens=num_ip_adapter_image_tokens)
         self.register_to_config(hidden_size=hidden_size)
+        self.register_to_config(num_semantic_classes=num_semantic_classes)
+        self.register_to_config(tokenizer_patch_size=tokenizer_patch_size)
+        self.register_to_config(use_sincos_pos_emb=use_sincos_pos_emb)
 
         self.ip_adapter_image_proj_model = self._initialize_image_proj_model(hidden_size, num_ip_adapter_image_tokens)
+
+        # 语义图 tokenizer：将离散语义/结构图转为 [B,N,D] tokens，其中 D 对齐为 hidden_size（与 Resampler.embedding_dim 一致）
+        self.semantic_tokenizer = SemanticMapTokenizer(
+            num_classes=num_semantic_classes,
+            embed_dim=hidden_size,
+            patch_size=tokenizer_patch_size,
+            use_sincos_pos_emb=use_sincos_pos_emb,
+        )
 
         # 若用户希望模型一创建就具有 IP-Adapter 能力，则在此初始化 attention processors
         # 注意: 这会把当前 to_k/ to_v 权重复制到 to_k_ip / to_v_ip 中，适用于直接 `from_pretrained` 场景。
@@ -388,6 +403,7 @@ class IPAdapterUNet2DConditionModel(UNet2DConditionModel):
         return_dict: bool = True,
         # =========== 自定义参数 ===========
         ip_adapter_image_embeds: Optional[List[torch.Tensor]] = None,
+        ip_adapter_semantic_map: Optional[torch.Tensor] = None,
     ) -> Union[UNet2DConditionOutput, Tuple]:
         # By default samples have to be AT least a multiple of the overall upsampling factor.
         # The overall upsampling factor is equal to 2 ** (# num of upsampling layers).
@@ -456,6 +472,10 @@ class IPAdapterUNet2DConditionModel(UNet2DConditionModel):
         # =========== 自定义： IP-Adapter image projection ===========
         if hasattr(self, "text_encoder_hid_proj") and self.text_encoder_hid_proj is not None:
             encoder_hidden_states = self.text_encoder_hid_proj(encoder_hidden_states)
+
+        # 期望输入形状 [B, C, H, W]（C=1/3），内部会进行取第1通道、round->clamp->long
+        tokens = self.semantic_tokenizer(ip_adapter_semantic_map)  # [B, N, D]
+        ip_adapter_image_embeds = [tokens.unsqueeze(1)]  # 适配 MultiIPAdapterImageProjection 的 [B,1,N,D]
 
         ip_adapter_image_embeds = self.ip_adapter_image_proj_model(ip_adapter_image_embeds)
         encoder_hidden_states = (encoder_hidden_states, ip_adapter_image_embeds)
@@ -608,8 +628,12 @@ class IPAdapterUNet2DConditionModel(UNet2DConditionModel):
         cls,
         unet: UNet2DConditionModel,
         num_ip_adapter_image_tokens: int = 16,
-        hidden_size: int = 1664,
+        hidden_size: int = 1664,  # TODO: 1664 是不是太大了？
         copy_weights: bool = True,
+        # ------ 语义 tokenizer 参数 ------
+        num_semantic_classes: int = 3,
+        tokenizer_patch_size: int = 16,
+        use_sincos_pos_emb: bool = True,
     ) -> "IPAdapterUNet2DConditionModel":
         """参考 `CRSDifUniControlNet.from_unet` 的构建方式, 直接从一个已经加载好的基础 UNet
         (通常是 *原生* Stable Diffusion 的 `UNet2DConditionModel`) 构造 IPAdapter 版本, 避免
@@ -677,8 +701,12 @@ class IPAdapterUNet2DConditionModel(UNet2DConditionModel):
             mid_block_only_cross_attention=getattr(cfg, "mid_block_only_cross_attention", None),
             cross_attention_norm=getattr(cfg, "cross_attention_norm", None),
             addition_embed_type_num_heads=getattr(cfg, "addition_embed_type_num_heads", 64),
+            # ----- 新增参数 -----
             num_ip_adapter_image_tokens=num_ip_adapter_image_tokens,
             hidden_size=hidden_size,
+            num_semantic_classes=num_semantic_classes,
+            tokenizer_patch_size=tokenizer_patch_size,
+            use_sincos_pos_emb=use_sincos_pos_emb,
         )
 
         # 先保存原 unet 权重
