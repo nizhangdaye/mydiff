@@ -76,7 +76,12 @@ def load_model(model_cfg: dict, accelerator: Accelerator):
         subfolder="unet",
         use_safetensors=False,
     )
-    ipadapter_unet = IPAdapterUNet2DConditionModel.from_unet(unet)
+    ipadapter_unet = IPAdapterUNet2DConditionModel.from_unet(
+        unet,
+        tokenizer_patch_size=model_cfg["ip_image_tokenizer_patch_size"],
+        ip_resampler_apply_pos_emb=model_cfg["ip_resampler_apply_pos_emb"],
+        ip_image_tokenizer_use_sincos_pos_emb=model_cfg["ip_image_tokenizer_use_sincos_pos_emb"],
+    )
 
     return noise_scheduler, tokenizer, text_encoder, image_encoder, image_processor, vae, unet, ipadapter_unet
 
@@ -437,7 +442,9 @@ def run_epoch(
                 # TODO: 阈值也可以用一个可学习的参数
                 # 将深度图进行多阈值分割，并裁剪为 244
                 ip_adapter_depth_semantic_map = simple_multi_threshold(
-                    controlnet_image_before_depth, target_size=224, thresholds=[-0.35, 0.15]
+                    controlnet_image_before_depth,
+                    target_size=model_cfg["simple_multi_threshold_target_size"],
+                    thresholds=model_cfg["simple_multi_threshold_thresholds"],
                 )
 
                 # 6. 原始图像 latent（mode）
@@ -625,18 +632,20 @@ def log_validation(
             before_depth_tensor = before_depth_tensor * 2.0 - 1.0
 
             # 通过 simple_multi_threshold 获得参考伪 RGB (与训练一致 224 尺寸 / 244? 使用训练里 target_size=224)
-            ip_adapter_semantic_map = simple_multi_threshold(
+            ip_adapter_image = simple_multi_threshold(
                 before_depth_tensor.unsqueeze(0),  # (1,3,H,W)
-                target_size=224,
-            )  # (1,3,224,224)
-
-            # 确保语义图在与模型相同的设备上，避免 CPU/GPU 混用导致的 embedding 报错
-            ip_adapter_semantic_map = ip_adapter_semantic_map.to(accelerator.device)
+                target_size=cfg["model"]["simple_multi_threshold_target_size"],
+                thresholds=cfg["model"]["simple_multi_threshold_thresholds"],
+            ).to(accelerator.device)  # (1,3,224,224)
+            # # 为与训练/CLIP 预处理一致：将类别索引缩放到 [0,1]，交由 pipeline 的 image_processor 做进一步标准化
+            # ip_adapter_image_for_embed = ip_adapter_image
+            # denom = torch.clamp(ip_adapter_image_for_embed.amax(dim=(1, 2, 3), keepdim=True), min=1.0)
+            # ip_adapter_image_for_embed = (ip_adapter_image_for_embed / denom).clamp(0, 1)
 
             edited = pipeline(
                 prompt=edit_instruction,
                 image=before_image,
-                ip_adapter_image=ip_adapter_semantic_map,
+                ip_adapter_image=ip_adapter_image,
                 num_inference_steps=inference_steps,
                 generator=generator,
                 guidance_scale=guidance_scale,
@@ -656,7 +665,7 @@ def log_validation(
             grid.paste(edited, (vis_w, vis_h))
             # 第二行第三列: 展示 simple_multi_threshold 的离散分类图（使用 tab10 调色板着色）
             # ip_adapter_image 形状为 (1, 3, target_size, target_size)，通道内容相同，取单通道类别索引
-            cls_map = ip_adapter_semantic_map[0, 0].detach().cpu().numpy()
+            cls_map = ip_adapter_image[0, 0].detach().cpu().numpy()
             cls_map = cls_map.astype(np.int32)
             num_classes = int(cls_map.max()) + 1
             num_classes = max(1, num_classes)

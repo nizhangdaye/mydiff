@@ -1,0 +1,85 @@
+# config.yaml
+seed: 42
+output_root: "/mnt/data/zwh/log/instructpix2pix_IP_Adapter"
+
+model:
+  unet_path: "/mnt/data/zwh/model/DiffusionSat/checkpoint-100000"
+  pretrained_model_name_or_path: "stabilityai/stable-diffusion-2-1" # required, must be set
+  # pretrained_model_name_or_path: "/mnt/data/zwh/model/DiffusionSat" # required, must be set
+  revision: null
+  variant: null
+  non_ema_revision: null
+  use_ema: true
+  # ======== IP-Adapter 图像处理相关参数 ========
+  ip_image_tokenizer_patch_size: 32
+  ip_image_tokenizer_use_sincos_pos_emb: true
+  ip_resampler_apply_pos_emb: false
+  simple_multi_threshold_target_size: 512
+  simple_multi_threshold_thresholds: [-0.35, 0.15] # TODO: 可以改为可学习的阈值
+
+training:
+  num_train_epochs: 400
+  max_train_steps: null
+  train_batch_size: 16
+  gradient_accumulation_steps: 2
+  gradient_checkpointing: true
+  max_train_samples: null # 32
+  validation_epochs: 1
+  resume_from_checkpoint: "latest"
+  checkpoints_total_limit: 2
+  # 时间步采样策略："uniform"（默认）或 "cubic"
+  # cubic 参考 InstructPix2Pix 论文 3.4 节：timesteps = (1 - u^3) * T
+  timestep_sampling: "cubic"
+
+optimizer:
+  learning_rate: 1.0e-4
+  scale_lr: false # 如果你的 base_lr 已经是“全局学习率”经过手动调参得到的，或模型/数据较敏感（如极小数据集、已接近收敛），直接放大会导致发散，此时不启用
+  use_8bit_adam: false
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_weight_decay: 0.01
+  adam_epsilon: 1.0e-08
+  max_grad_norm: 1.0
+
+lr_scheduler:
+  # 选择学习率调度器：
+  # - 使用 diffusers.get_scheduler 支持的名称 (如 constant, cosine, linear 等)
+  # - 或使用自定义 "plateau" 启用 torch.optim.lr_scheduler.ReduceLROnPlateau
+  lr_scheduler: "plateau"
+  lr_warmup_steps: 0 # 非 plateau 时生效
+  plateau_patience: 10 # plateau 模式：多少个 epoch 无改进后降 LR
+  plateau_factor: 0.5 # plateau 模式：LR 乘以该因子
+  min_lr: 2.0e-5 # 最小学习率
+
+data:
+  dataset_path: "/mnt/data/zwh/data/maxar/disaster_dataset"
+  resolution: 512
+  center_crop: false
+  random_flip: false
+  dataloader_num_workers: 4
+  # 新的条件与文本丢弃策略（仅前两个条件当前生效：深度、语义）
+  dropout:
+    drop_txt_prob: 0.5
+    keep_all_cond_prob: 0.1
+    drop_all_cond_prob: 0.1
+    drop_each_cond_prob: [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
+  use_fixed_edit_text: false
+
+logging:
+  logging_dir: "logs"
+  report_to: "tensorboard"
+  project_name: "InstructPix2Pix_IP_Adapter_Semantic_Tokenizer"
+
+checkpointing:
+  checkpoint_epochs: 50
+
+validation:
+  num_inference_steps: 20
+
+precision:
+  mixed_precision: "fp16" # ["no", "fp16", "bf16"]
+  allow_tf32: false
+  enable_xformers_memory_efficient_attention: true
+
+distributed:
+  local_rank: -1

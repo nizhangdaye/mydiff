@@ -99,10 +99,11 @@ class IPAdapterUNet2DConditionModel(UNet2DConditionModel):
         # ========== IP-Adapter 新增参数 ==========
         num_ip_adapter_image_tokens: Optional[int] = 16,  # 必须提供，
         hidden_size: Optional[int] = 1664,  # image encoder hidden size, 必须提供
+        ip_resampler_apply_pos_emb: bool = False,
         # ========== 语义 tokenizer 参数（可选） ==========
         num_semantic_classes: int = 3,
         tokenizer_patch_size: int = 16,
-        use_sincos_pos_emb: bool = True,
+        ip_image_tokenizer_use_sincos_pos_emb: bool = True,
     ):
         super().__init__(
             sample_size=sample_size,
@@ -158,16 +159,19 @@ class IPAdapterUNet2DConditionModel(UNet2DConditionModel):
         self.register_to_config(hidden_size=hidden_size)
         self.register_to_config(num_semantic_classes=num_semantic_classes)
         self.register_to_config(tokenizer_patch_size=tokenizer_patch_size)
-        self.register_to_config(use_sincos_pos_emb=use_sincos_pos_emb)
+        self.register_to_config(ip_image_tokenizer_use_sincos_pos_emb=ip_image_tokenizer_use_sincos_pos_emb)
+        self.register_to_config(ip_resampler_apply_pos_emb=ip_resampler_apply_pos_emb)
 
-        self.ip_adapter_image_proj_model = self._initialize_image_proj_model(hidden_size, num_ip_adapter_image_tokens)
+        self.ip_adapter_image_proj_model = self._initialize_image_proj_model(
+            hidden_size, num_ip_adapter_image_tokens, ip_resampler_apply_pos_emb
+        )
 
         # 语义图 tokenizer：将离散语义/结构图转为 [B,N,D] tokens，其中 D 对齐为 hidden_size（与 Resampler.embedding_dim 一致）
         self.semantic_tokenizer = SemanticMapTokenizer(
             num_classes=num_semantic_classes,
             embed_dim=hidden_size,
             patch_size=tokenizer_patch_size,
-            use_sincos_pos_emb=use_sincos_pos_emb,
+            use_sincos_pos_emb=ip_image_tokenizer_use_sincos_pos_emb,
         )
 
         # 若用户希望模型一创建就具有 IP-Adapter 能力，则在此初始化 attention processors
@@ -175,7 +179,7 @@ class IPAdapterUNet2DConditionModel(UNet2DConditionModel):
         # 在从现有基础 UNet 迁移 (`from_unet`) 时我们会先复制外部权重，再调用初始化，以获得更合理的拷贝。
         self._initialize_adapter_modules(num_tokens=num_ip_adapter_image_tokens)
 
-    def _initialize_image_proj_model(self, hidden_size, num_tokens):
+    def _initialize_image_proj_model(self, hidden_size, num_tokens, apply_pos_emb):
         """初始化图像特征投影模块并把必要字段写入 config。
 
         之前只注册了 encoder_hid_dim_type, 未把真正需要在二次 from_pretrained 时
@@ -197,6 +201,7 @@ class IPAdapterUNet2DConditionModel(UNet2DConditionModel):
             embedding_dim=hidden_size,
             output_dim=self.config.cross_attention_dim,
             ff_mult=4,
+            apply_pos_emb=apply_pos_emb,
         )
         image_projection_layers = [image_projection_layer]
 
@@ -633,7 +638,8 @@ class IPAdapterUNet2DConditionModel(UNet2DConditionModel):
         # ------ 语义 tokenizer 参数 ------
         num_semantic_classes: int = 3,
         tokenizer_patch_size: int = 16,
-        use_sincos_pos_emb: bool = True,
+        ip_image_tokenizer_use_sincos_pos_emb: bool = True,
+        ip_resampler_apply_pos_emb: bool = False,
     ) -> "IPAdapterUNet2DConditionModel":
         """参考 `CRSDifUniControlNet.from_unet` 的构建方式, 直接从一个已经加载好的基础 UNet
         (通常是 *原生* Stable Diffusion 的 `UNet2DConditionModel`) 构造 IPAdapter 版本, 避免
@@ -706,7 +712,8 @@ class IPAdapterUNet2DConditionModel(UNet2DConditionModel):
             hidden_size=hidden_size,
             num_semantic_classes=num_semantic_classes,
             tokenizer_patch_size=tokenizer_patch_size,
-            use_sincos_pos_emb=use_sincos_pos_emb,
+            ip_image_tokenizer_use_sincos_pos_emb=ip_image_tokenizer_use_sincos_pos_emb,
+            ip_resampler_apply_pos_emb=ip_resampler_apply_pos_emb,
         )
 
         # 先保存原 unet 权重

@@ -2,6 +2,7 @@ import math
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from einops import rearrange
 from einops.layers.torch import Rearrange
 
@@ -100,6 +101,11 @@ class Resampler(nn.Module):
         self.proj_out = nn.Linear(dim, output_dim)
         self.norm_out = nn.LayerNorm(output_dim)
 
+        # TODO: 是否使用？
+        # 普通的 Resampler 主要依靠可学习的查询（self.latents）通过交叉注意力从输入序列中提取信息
+        # 然而，这些查询是内容不可知的，它们不知道输入序列的整体概貌
+        # 引入了一个代表整个序列全局语义的单一向量，将这个单一向量转为 num_latents_mean_pooled 个查询 token
+        # 与原来的查询 token 进行拼接，提升对输入序列的感知能力
         self.to_latents_from_mean_pooled_seq = (
             nn.Sequential(
                 nn.LayerNorm(dim),
@@ -185,8 +191,6 @@ class SemanticMapTokenizer(nn.Module):
         self.use_sincos_pos_emb = bool(use_sincos_pos_emb)
 
         self.class_embed = nn.Embedding(self.num_classes, self.embed_dim)
-        # 使用平均池化进行 patch 聚合（在通道维是 embedding 维）
-        self.pool = nn.AvgPool2d(kernel_size=self.patch_size, stride=self.patch_size, ceil_mode=False)
 
         # ✅ LayerNorm 归一化，稳定输出
         self.norm = nn.LayerNorm(self.embed_dim)
@@ -232,36 +236,42 @@ class SemanticMapTokenizer(nn.Module):
         """
         semantic_map: [B, C, H, W], C 可以为 1 或 3；仅使用第 1 个通道作为类别索引。
         返回: tokens [B, N, D]，N = (H//p)*(W//p)。
+        内存友好版：先将类别索引图用最近邻下采样到 patch 网格 (hp, wp)，再做 Embedding，避免构造 [B,D,H,W]。
         """
         if semantic_map.dim() != 4:
             raise ValueError(f"semantic_map must be 4D [B,C,H,W], got {semantic_map.shape}")
 
         b, c, h, w = semantic_map.shape
         # 取第一个通道，四舍五入到最近的类索引
-        idx = semantic_map[:, 0].round().clamp(0, self.num_classes - 1).long()  # [B, H, W]
+        idx_full = semantic_map[:, 0].round().clamp(0, self.num_classes - 1).long()  # [B, H, W]
 
-        # 像素级嵌入
-        pix_emb = self.class_embed(idx)  # [B, H, W, D]
-        pix_emb = pix_emb.permute(0, 3, 1, 2)  # [B, D, H, W]
+        # 计算 patch 网格大小
+        hp = max(1, h // self.patch_size)
+        wp = max(1, w // self.patch_size)
+        # 最近邻下采样到 patch 网格（保持离散标签）
+        idx_small = (
+            F.interpolate(idx_full.unsqueeze(1).float(), size=(hp, wp), mode="nearest").squeeze(1).long()
+        )  # [B, hp, wp]
 
-        # patch 平均池化聚合
-        pooled = self.pool(pix_emb)  # [B, D, H', W']
-        _, d, hp, wp = pooled.shape
+        # 对下采样后的类别索引做嵌入，避免 [B,D,H,W] 巨大激活
+        emb = self.class_embed(idx_small)  # [B, hp, wp, D]
+        emb = emb.permute(0, 3, 1, 2).contiguous()  # [B, D, hp, wp]
+        d = emb.shape[1]
 
         if self.use_sincos_pos_emb:
             # ✅ 缓存并复用位置编码
             if (
                 self._pos_cache is None
                 or self._pos_cache.shape[1:] != (d, hp, wp)
-                or self._pos_cache.device != pooled.device
-                or self._pos_cache.dtype != pooled.dtype
+                or self._pos_cache.device != emb.device
+                or self._pos_cache.dtype != emb.dtype
             ):
-                pos = self._build_2d_sincos_pos_embed(hp, wp, d, pooled.device, pooled.dtype)
+                pos = self._build_2d_sincos_pos_embed(hp, wp, d, emb.device, emb.dtype)
                 pos = pos.permute(0, 3, 1, 2)  # [1, D, H', W']
                 self._pos_cache = pos
-            pooled = pooled + self._pos_cache
-
-        tokens = pooled.permute(0, 2, 3, 1).reshape(b, hp * wp, d)  # [B, N, D]
-        tokens = self.norm(tokens)  # ✅ LayerNorm
+            emb = emb + self._pos_cache
+        tokens = emb.permute(0, 2, 3, 1).reshape(b, hp * wp, d)  # [B, N, D]
+        # 可选 LayerNorm 稳定输出
+        tokens = self.norm(tokens)
 
         return tokens
