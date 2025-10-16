@@ -4,8 +4,8 @@ output_root: "/mnt/data/zwh/log/instructpix2pix_T2I"
 
 model:
   unet_path: "/mnt/data/zwh/model/DiffusionSat/checkpoint-100000"
-  # pretrained_model_name_or_path: "stabilityai/stable-diffusion-2-1" # required, must be set
-  pretrained_model_name_or_path: "/mnt/data/zwh/model/DiffusionSat" # required, must be set
+  pretrained_model_name_or_path: "stabilityai/stable-diffusion-2-1" # required, must be set
+  # pretrained_model_name_or_path: "/mnt/data/zwh/model/DiffusionSat" # required, must be set
   revision: null
   variant: null
   non_ema_revision: null
@@ -29,7 +29,7 @@ training:
   max_train_samples: null
   validation_epochs: 1
   resume_from_checkpoint: "latest"
-  checkpoints_total_limit: 5
+  checkpoints_total_limit: 2
   # 时间步采样策略："uniform"（默认）或 "cubic"
   # cubic 参考 InstructPix2Pix 论文 3.4 节：timesteps = (1 - u^3) * T
   timestep_sampling: "cubic"
@@ -73,7 +73,7 @@ logging:
   report_to: "tensorboard"
 
 checkpointing:
-  checkpoint_epochs: 10
+  checkpoint_epochs: 50
 
 validation:
   num_inference_steps: 20

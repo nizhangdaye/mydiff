@@ -36,6 +36,7 @@ from diffusers import (
 )
 from src.data.instruct_pix2pix_dataset import ImageEditDataset, collate_fn
 from src.pipeline.instructP2P_T2I_Pipeline import InstructPix2PixT2IAdapterPipeline
+from utils.depth_processing import simple_multi_threshold
 
 
 def load_config(config_path: str) -> dict:
@@ -469,6 +470,15 @@ def run_epoch(
                     batch["before_depth_pixel_values"].to(dtype=weight_dtype).repeat(1, 3, 1, 1)
                 )  # [B, 3, H, W]
                 controlnet_image_before_seg = batch["before_seg_pixel_values"].to(dtype=weight_dtype)  # [B, 3, H, W]
+                # TODO: 阈值也可以用一个可学习的参数
+                # 将深度图进行多阈值分割，并裁剪为 244
+                ip_adapter_depth_semantic_map = simple_multi_threshold(
+                    controlnet_image_before_depth,
+                    target_size=model_cfg["simple_multi_threshold_target_size"],
+                    thresholds=model_cfg["simple_multi_threshold_thresholds"],
+                )
+                # 将类别 0 视为低洼掩码（1 表示低洼，其他为 0）
+                ip_adapter_depth_semantic_map = (ip_adapter_depth_semantic_map == 0).to(dtype=weight_dtype)
 
                 # 6. 原始图像 latent（mode）
                 original_image_embeds = vae.encode(batch["original_pixel_values"].to(weight_dtype)).latent_dist.mode()
@@ -521,6 +531,7 @@ def run_epoch(
                         sample.to(dtype=weight_dtype) for sample in down_block_additional_residuals
                     ],
                     return_dict=False,
+                    cross_attention_kwargs={"depth_mask": ip_adapter_depth_semantic_map},
                 )[0]
 
                 loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
@@ -590,7 +601,9 @@ def log_validation(
     pipeline = pipeline.to(accelerator.device)
     pipeline.set_progress_bar_config(disable=True)
 
-    if cfg["precision"].get("enable_xformers_memory_efficient_attention"):
+    if cfg["precision"].get("enable_xformers_memory_efficient_attention") and not getattr(
+        pipeline, "_enable_flood_aware_attn", False
+    ):
         pipeline.enable_xformers_memory_efficient_attention()
 
     resolution = cfg["data"].get("resolution")
@@ -989,6 +1002,8 @@ def main():
                     adapter=unwrap_model(adapter),
                     safety_checker=None,
                     requires_safety_checker=False,
+                    enable_flood_aware_attn=True,
+                    flood_depth_bias_weight=1.0,
                 )
 
                 log_validation(pipeline, cfg, accelerator, generator, epoch, val_dataset)
@@ -1022,6 +1037,8 @@ def main():
             adapter=unwrap_model(adapter),
             safety_checker=None,
             requires_safety_checker=False,
+            enable_flood_aware_attn=True,
+            flood_depth_bias_weight=1.0,
         )
         pipeline.save_pretrained(output_dir)
 

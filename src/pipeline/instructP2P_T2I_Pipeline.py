@@ -48,6 +48,8 @@ class InstructPix2PixT2IAdapterPipeline(StableDiffusionInstructPix2PixPipeline):
         feature_extractor=None,
         image_encoder=None,
         requires_safety_checker: bool = False,
+        enable_flood_aware_attn: bool = False,
+        flood_depth_bias_weight: float = 1.0,
     ):
         super().__init__(
             vae=vae,
@@ -62,12 +64,24 @@ class InstructPix2PixT2IAdapterPipeline(StableDiffusionInstructPix2PixPipeline):
         )
         self.adapter = adapter.to("cuda")
         self.register_modules(adapter=adapter)
+        # 可选：替换注意力处理器为 FloodAware，以便接收 depth_mask
+        self._enable_flood_aware_attn = enable_flood_aware_attn
+        self._flood_depth_bias_weight = flood_depth_bias_weight
+        if self._enable_flood_aware_attn:
+            from src.models.attention_processor.flood_aware_attn_processor import (
+                FloodAwareAttnProcessor2_0,
+            )
+
+            proc = FloodAwareAttnProcessor2_0()
+            # 将所有注意力层替换为自定义处理器
+            self.unet.set_attn_processor(proc)
 
     @torch.no_grad()
     def __call__(
         self,
         prompt: Union[str, List[str]],
         image: PipelineImageInput,  # 编辑前的图片
+        attention_mask: Optional[torch.Tensor] = None,
         control_image: Optional[PipelineImageInput] = None,  # 深度，语义等
         num_inference_steps: int = 50,
         guidance_scale: float = 7.5,
@@ -93,6 +107,7 @@ class InstructPix2PixT2IAdapterPipeline(StableDiffusionInstructPix2PixPipeline):
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
         cross_attention_kwargs: Optional[Dict[str, Any]] = None,
         adapter_scale: float = 1.0,
+        depth_thresholds: Optional[List[float]] = None,  # 自定义三分类阈值
         **kwargs,
     ):
         """执行图像编辑推理。
@@ -116,6 +131,21 @@ class InstructPix2PixT2IAdapterPipeline(StableDiffusionInstructPix2PixPipeline):
         # 2. 预处理图像 (InstructPix2Pix 输入 & Adapter 输入)
         image_tensor = self.image_processor.preprocess(image)
         adapter_tensor = self.image_processor.preprocess(control_image)
+
+        # 2.1 计算 depth_mask（若启用洪水感知注意力且提供了 control_image）
+        depth_mask = None
+        if self._enable_flood_aware_attn and control_image is not None:
+            # control_image 期望为深度图（RGB 或单通道），转换到 [-1,1]，再三分类
+            from src.utils.depth_processing import simple_multi_threshold
+
+            # 若 adapter_tensor 范围在 [-1,1]，则直接用；否则归一化
+            # depth_src: (B,3,H,W) 或 (3,H,W)（image_processor.preprocess 会输出 (B, C, H, W)）
+            if control_image.dim() == 3:
+                control_image = control_image.unsqueeze(0)
+            # simple_multi_threshold 期望 [-1,1]，此处 image_processor 已满足
+            target_size = int(image_tensor.shape[-1] // self.vae_scale_factor)  # 与 latent 分辨率一致的最近平方根尺寸
+            # 使用传入阈值或默认
+            depth_mask = simple_multi_threshold(control_image, target_size=target_size, thresholds=depth_thresholds)
 
         # 3. 设置时间步
         self.scheduler.set_timesteps(num_inference_steps, device=device)
@@ -154,6 +184,22 @@ class InstructPix2PixT2IAdapterPipeline(StableDiffusionInstructPix2PixPipeline):
         for k, v in enumerate(adapter_residuals):
             adapter_residuals[k] = v * adapter_scale
 
+        # 准备 cross_attention_kwargs 并对齐 batch
+        if cross_attention_kwargs is None:
+            cross_attention_kwargs = {}
+        if depth_mask is not None:
+            # 将类别 0 视为低洼掩码（1 表示低洼，其他为 0）
+            low_mask = (depth_mask[:, :1] == 0).to(device=device, dtype=image_latents.dtype)  # (B,1,h,w)
+            # 若启用 CFG，batch 需扩展到 3 倍
+            do_cfg = guidance_scale > 1.0 and image_guidance_scale >= 1.0
+            batch_mult = 3 if do_cfg else 1
+            low_mask = low_mask.repeat(batch_mult, 1, 1, 1)
+            cross_attention_kwargs = {
+                **cross_attention_kwargs,
+                "depth_mask": low_mask,
+                "depth_bias_weight": self._flood_depth_bias_weight,
+            }
+
         # 7. 去噪循环
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         self._num_timesteps = len(timesteps)
@@ -172,6 +218,7 @@ class InstructPix2PixT2IAdapterPipeline(StableDiffusionInstructPix2PixPipeline):
                     down_intrablock_additional_residuals=[state.clone() for state in adapter_residuals],
                     mid_block_additional_residual=None,
                     cross_attention_kwargs=cross_attention_kwargs,
+                    attention_mask=attention_mask,
                     return_dict=False,
                 )[0]
 
