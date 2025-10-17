@@ -1014,11 +1014,11 @@ def main():
                 best_dir = os.path.join(output_dir, f"best_{epoch + 1}")
                 accelerator.save_state(best_dir)
                 accelerator.print(
-                    f"[Best Model] Epoch {epoch} new best loss {epoch_avg_loss:.6f} (prev {prev:.6f}). Saved to {best_dir}"
+                    f"[Best Model] Epoch {epoch + 1} new best loss {epoch_avg_loss:.6f} (prev {prev:.6f}). Saved to {best_dir}"
                 )
 
         if accelerator.is_main_process:
-            if epoch % train_cfg.get("validation_epochs") == 0:
+            if (epoch + 1) % train_cfg.get("validation_epochs") == 0:
                 if model_cfg.get("use_ema"):
                     ema_ip_adapter.store(instruct_p2p_ipadapter_unet.parameters())
                     ema_ip_adapter.copy_to(instruct_p2p_ipadapter_unet.parameters())
@@ -1035,7 +1035,7 @@ def main():
                     feature_extractor=image_processor,
                 )
 
-                log_validation(pipeline, cfg, accelerator, generator, epoch, val_dataset)
+                log_validation(pipeline, cfg, accelerator, generator, epoch + 1, val_dataset)
 
                 if model_cfg.get("use_ema"):
                     ema_ip_adapter.restore(instruct_p2p_ipadapter_unet.parameters())
@@ -1068,8 +1068,6 @@ def main():
         )
         pipeline.save_pretrained(output_dir)
 
-    if accelerator.is_main_process:
-        log_validation(pipeline, cfg, accelerator, generator, epoch, val_dataset)
     accelerator.end_training()
 
 

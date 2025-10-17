@@ -961,7 +961,7 @@ def main():
             # ReduceLROnPlateau 在 epoch 结束后根据 loss 调整
             lr_scheduler.step(epoch_avg_loss)
             log_payload.update({"lr": lr_scheduler.get_last_lr()[0]})
-        accelerator.log(log_payload, step=epoch)
+        accelerator.log(log_payload, step=epoch + 1)
 
         # ========== 最优模型保存逻辑 (基于 epoch 平均 loss) ==========
         # 在主进程比较并保存最优 checkpoint (含状态)。
@@ -982,11 +982,11 @@ def main():
                 best_dir = os.path.join(output_dir, f"best_{epoch + 1}")
                 accelerator.save_state(best_dir)
                 accelerator.print(
-                    f"[Best Model] Epoch {epoch} new best loss {epoch_avg_loss:.6f} (prev {prev:.6f}). Saved to {best_dir}"
+                    f"[Best Model] Epoch {epoch + 1} new best loss {epoch_avg_loss:.6f} (prev {prev:.6f}). Saved to {best_dir}"
                 )
 
         if accelerator.is_main_process:
-            if epoch % train_cfg.get("validation_epochs") == 0:
+            if (epoch + 1) % train_cfg.get("validation_epochs") == 0:
                 if model_cfg.get("use_ema"):
                     ema_unet.store(unet.parameters())
                     ema_unet.copy_to(unet.parameters())
@@ -1006,7 +1006,7 @@ def main():
                     flood_depth_bias_weight=1.0,
                 )
 
-                log_validation(pipeline, cfg, accelerator, generator, epoch, val_dataset)
+                log_validation(pipeline, cfg, accelerator, generator, epoch + 1, val_dataset)
 
                 if model_cfg.get("use_ema"):
                     ema_unet.restore(unet.parameters())
@@ -1042,8 +1042,6 @@ def main():
         )
         pipeline.save_pretrained(output_dir)
 
-    if accelerator.is_main_process:
-        log_validation(pipeline, cfg, accelerator, generator, epoch, val_dataset)
     accelerator.end_training()
 
 
