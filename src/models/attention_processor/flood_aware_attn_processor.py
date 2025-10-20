@@ -5,7 +5,7 @@ import torch.nn.functional as F
 
 
 class FloodAwareAttnProcessor2_0:
-    def __init__(self, depth_bias_weight: float = 1.0):
+    def __init__(self):
         """
         Args:
             depth_bias_weight (float): 空间偏置强度，默认为 1.0。
@@ -16,10 +16,10 @@ class FloodAwareAttnProcessor2_0:
     def __call__(
         self,
         attn,
-        hidden_states,
-        encoder_hidden_states=None,
-        attention_mask=None,
-        temb=None,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        temb: Optional[torch.Tensor] = None,
         depth_mask=None,  # ← 低洼区域掩码  1 为低洼，0 为非低洼
         depth_bias_weight=1,  # ← 可选：运行时覆盖权重
         *args,
@@ -73,30 +73,44 @@ class FloodAwareAttnProcessor2_0:
 
         # ================================================
         # 应用空间偏置（仅当 depth_mask 提供时）
+        # 改为通过 SDPA 的 attn_mask 传入加性偏置，避免手写 matmul/softmax
         # ================================================
         if depth_mask is not None:
             # 无论 depth_mask 是三通道还是单通道，每个通道都一样，取第一个通道
             low_mask = depth_mask[:, :1, :, :]  # shape: [B, 1, H, W]
 
-            # 插值到当前特征图尺寸
-            current_size = int(sequence_length**0.5)
-            if low_mask.shape[-2:] != (current_size, current_size):
+            # 插值到当前特征图尺寸（与 query 的 token 数一致）
+            q_len = query.shape[-2]
+            # 非 4D 情况下假设方形网格（常见于 UNet flatten 后）；否则用户应提供匹配尺寸
+            current_size = int(q_len**0.5)
+            if current_size * current_size != q_len or low_mask.shape[-2:] != (current_size, current_size):
                 low_mask = F.interpolate(low_mask.float(), size=(current_size, current_size), mode="nearest")
-            # 展平为 [B, L]
-            low_mask_flat = low_mask.view(batch_size, 1, sequence_length)  # (B, 1, L)
 
-            # 构建偏置：query 位置为低洼时，所有 key 都加分
-            spatial_bias = low_mask_flat.unsqueeze(1).unsqueeze(-1)  # (B, 1, L, 1) → broadcast to (B, heads, L, L)
+            # 展平为 [B, Lq]，构造 (B, 1, Lq, 1) 的加性偏置，沿 heads 与 keys 维度广播
+            low_mask_flat = low_mask.view(batch_size, -1).to(dtype=query.dtype)
 
-            # 手动计算 attention
-            attn_scores = torch.matmul(query, key.transpose(-2, -1)) / (head_dim**0.5)
-            attn_scores = attn_scores + depth_bias_weight * spatial_bias
+            spatial_bias = low_mask_flat.view(batch_size, 1, q_len, 1)
+            spatial_bias = depth_bias_weight * spatial_bias  # (B, 1, Lq, 1)
+            k_len = key.shape[-2]
 
-            if attention_mask is not None:
-                attn_scores = attn_scores + attention_mask
+            # 合并已有 attention_mask：支持 bool 掩码或加性掩码
+            if attention_mask is None:
+                # 显式扩展到 (B, H, Lq, Sk) 并确保连续
+                attn_mask_total = spatial_bias.expand(batch_size, attn.heads, q_len, k_len).contiguous()
+            else:
+                if attention_mask.dtype == torch.bool:
+                    # 将布尔掩码转换为加性掩码：被屏蔽位置为 -inf
+                    float_mask = torch.zeros_like(attention_mask, dtype=query.dtype)
+                    float_mask = float_mask.masked_fill(~attention_mask, float("-inf"))
+                else:
+                    float_mask = attention_mask.to(dtype=query.dtype)
+                # 将 spatial_bias 显式扩展到 float_mask 的形状，避免广播视图的非连续最后一维
+                sb_expanded = spatial_bias.expand_as(float_mask).contiguous()
+                attn_mask_total = (float_mask + sb_expanded).contiguous()
 
-            attn_weights = F.softmax(attn_scores, dim=-1)
-            hidden_states = torch.matmul(attn_weights, value)
+            hidden_states = F.scaled_dot_product_attention(
+                query, key, value, attn_mask=attn_mask_total, dropout_p=0.0, is_causal=False
+            )
         else:
             # 默认行为
             hidden_states = F.scaled_dot_product_attention(

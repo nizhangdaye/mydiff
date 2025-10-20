@@ -8,6 +8,7 @@ from typing import Any, Dict, List
 
 import accelerate
 import datasets
+import matplotlib.cm as cm
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -35,8 +36,9 @@ from diffusers import (
     UniPCMultistepScheduler,
 )
 from src.data.instruct_pix2pix_dataset import ImageEditDataset, collate_fn
+from src.models.attention_processor.flood_aware_attn_processor import FloodAwareAttnProcessor2_0
 from src.pipeline.instructP2P_T2I_Pipeline import InstructPix2PixT2IAdapterPipeline
-from utils.depth_processing import simple_multi_threshold
+from src.utils.depth_processing import simple_multi_threshold
 
 
 def load_config(config_path: str) -> dict:
@@ -67,6 +69,8 @@ def load_model(model_cfg: dict, accelerator: Accelerator):
         subfolder="unet",
         use_safetensors=False,
     )
+    if model_cfg.get("flood_aware_attn_processor") is True:
+        unet.set_attn_processor(FloodAwareAttnProcessor2_0())
     # TODO: 如果有多种条件，需要并行 adapter，可以调用 MultiAdapter 进行管理
     if model_cfg.get("t2i_adapter_path"):
         accelerator.print(f"Loading T2IAdapter from {model_cfg.get('t2i_adapter_path')}")
@@ -611,6 +615,10 @@ def log_validation(
 
     accelerator.print(f"Running validation epoch={epoch} (steps={inference_steps}) on {len(val_dataset)} samples...")
 
+    save_dir = os.path.join(cfg["output_dir"], "validation", f"epoch-{epoch}")
+    if accelerator.is_main_process:
+        os.makedirs(save_dir, exist_ok=True)
+
     autocast_ctx = torch.autocast(accelerator.device.type)
     validation_results = []
 
@@ -665,6 +673,36 @@ def log_validation(
             grid.paste(before_depth_img, (vis_w * 2, 0))
             grid.paste(before_seg_img.convert("RGB"), (0, vis_h))
             grid.paste(edited_image, (vis_w, vis_h))
+            # 第二行第三列: 展示 simple_multi_threshold 的离散分类图（使用 tab10 调色板着色）
+            # ip_adapter_image 形状为 (1, 3, target_size, target_size)，通道内容相同，取单通道类别索引
+            # 将 [0,1] 拉回到 [-1,1]，与训练期假设一致
+            before_depth_tensor = before_depth_tensor * 2.0 - 1.0
+
+            # 通过 simple_multi_threshold 获得参考伪 RGB (与训练一致 224 尺寸 / 244? 使用训练里 target_size=224)
+            ip_adapter_image = simple_multi_threshold(
+                before_depth_tensor.unsqueeze(0),  # (1,3,H,W)
+                target_size=cfg["model"]["simple_multi_threshold_target_size"],
+                thresholds=cfg["model"]["simple_multi_threshold_thresholds"],
+            ).to(accelerator.device)  # (1,3,224,224)
+
+            cls_map = ip_adapter_image[0, 0].detach().cpu().numpy()
+            cls_map = cls_map.astype(np.int32)
+            num_classes = int(cls_map.max()) + 1
+            num_classes = max(1, num_classes)
+
+            # 采用 tab10 调色板，确保至少有 num_classes 个颜色
+            cmap = cm.get_cmap("tab10", max(10, num_classes))
+            palette = cmap(np.arange(max(10, num_classes)))  # (K,4) RGBA in [0,1]
+
+            # 依据类别索引直接查表着色
+            color_img = palette[cls_map][..., :3]  # (H,W,3)
+            color_img = (color_img * 255).astype(np.uint8)
+
+            ip_vis_img = Image.fromarray(color_img, mode="RGB").resize((vis_w, vis_h), Image.NEAREST)
+            grid.paste(ip_vis_img, (vis_w * 2, vis_h))
+
+            if accelerator.is_main_process:
+                grid.save(os.path.join(save_dir, f"sample_{idx}.png"))
 
             validation_results.append(
                 {
@@ -762,6 +800,8 @@ def main():
     if precision_cfg.get("enable_xformers_memory_efficient_attention"):
         unet.enable_xformers_memory_efficient_attention()
         adapter.enable_xformers_memory_efficient_attention()
+
+    accelerator.print(unet)
 
     def unwrap_model(model):
         model = accelerator.unwrap_model(model)

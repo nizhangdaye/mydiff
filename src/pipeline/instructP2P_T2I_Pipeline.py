@@ -140,12 +140,11 @@ class InstructPix2PixT2IAdapterPipeline(StableDiffusionInstructPix2PixPipeline):
 
             # 若 adapter_tensor 范围在 [-1,1]，则直接用；否则归一化
             # depth_src: (B,3,H,W) 或 (3,H,W)（image_processor.preprocess 会输出 (B, C, H, W)）
-            if control_image.dim() == 3:
-                control_image = control_image.unsqueeze(0)
+            # if control_image.dim() == 3:
+            #     control_image = control_image.unsqueeze(0)
             # simple_multi_threshold 期望 [-1,1]，此处 image_processor 已满足
-            target_size = int(image_tensor.shape[-1] // self.vae_scale_factor)  # 与 latent 分辨率一致的最近平方根尺寸
             # 使用传入阈值或默认
-            depth_mask = simple_multi_threshold(control_image, target_size=target_size, thresholds=depth_thresholds)
+            depth_mask = simple_multi_threshold(adapter_tensor, target_size=512, thresholds=depth_thresholds)
 
         # 3. 设置时间步
         self.scheduler.set_timesteps(num_inference_steps, device=device)
