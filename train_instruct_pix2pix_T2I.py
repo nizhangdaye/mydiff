@@ -69,7 +69,9 @@ def load_model(model_cfg: dict, accelerator: Accelerator):
         subfolder="unet",
         use_safetensors=False,
     )
+
     if model_cfg.get("flood_aware_attn_processor") is True:
+        accelerator.print(f"use FloodAwareAttnProcessor2_0 in UNet")
         unet.set_attn_processor(FloodAwareAttnProcessor2_0())
     # TODO: 如果有多种条件，需要并行 adapter，可以调用 MultiAdapter 进行管理
     if model_cfg.get("t2i_adapter_path"):

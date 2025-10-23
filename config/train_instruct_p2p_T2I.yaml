@@ -1,9 +1,9 @@
 # config.yaml
 seed: 42
-output_root: "/data/zhangwh/log/instructpix2pix_T2I"
+output_root: "/mnt/data/zwh/log/instructpix2pix_T2I"
 
 model:
-  unet_path: "/data/zhangwh/models/DiffusionSat/checkpoint-100000"
+  unet_path: "/mnt/data/zwh/model/DiffusionSat/checkpoint-100000"
   pretrained_model_name_or_path: "stabilityai/stable-diffusion-2-1" # required, must be set
   # pretrained_model_name_or_path: "/mnt/data/zwh/model/DiffusionSat" # required, must be set
   revision: null
@@ -11,7 +11,7 @@ model:
   non_ema_revision: null
   use_ema: true
   # ---- U-net ----
-  flood_aware_attn_processor: ture
+  flood_aware_attn_processor: true
   # ---- T2I Adapter ----
   t2i_adapter_path: null # 预训练 adapter 路径（为空则随机初始化）
   # TODO: 目前只支持一种条件
@@ -60,7 +60,7 @@ lr_scheduler:
   min_lr: 2.0e-5 # 最小学习率
 
 data:
-  dataset_path: "/data/zhangwh/data/maxar/disaster_dataset"
+  dataset_path: "/mnt/data/zwh/data/maxar/disaster_dataset"
   resolution: 512
   center_crop: false
   random_flip: false
