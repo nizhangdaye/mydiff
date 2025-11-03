@@ -12,13 +12,19 @@ model:
 training:
   num_train_epochs: 400
   max_train_steps: null
-  train_batch_size: 16
-  gradient_accumulation_steps: 2
+  train_batch_size: 4
+  gradient_accumulation_steps: 8
   gradient_checkpointing: true
   max_train_samples: null # 32
   validation_epochs: 1
   resume_from_checkpoint: "latest"
   checkpoints_total_limit: 2
+  loss:
+    hed:
+      enabled: true
+      weight: 1
+      loss_type: "l1" # l1 | l2
+      model_path: "/mnt/data/zwh/model/HED/ControlNetHED.pth" # 请按需修改
 
 optimizer:
   learning_rate: 1.0e-4
@@ -38,7 +44,7 @@ lr_scheduler:
   lr_warmup_steps: 0 # 非 plateau 时生效
   plateau_patience: 10 # plateau 模式：多少个 epoch 无改进后降 LR
   plateau_factor: 0.5 # plateau 模式：LR 乘以该因子
-  min_lr: 2.0e-5 # 最小学习率
+  min_lr: 1.0e-5 # 最小学习率
 
 data:
   dataset_path: "/mnt/data/zwh/data/maxar/disaster_dataset"

@@ -32,11 +32,11 @@ from diffusers import (
     AutoencoderKL,
     DDPMScheduler,
     StableDiffusionInstructPix2PixPipeline,
-    T2IAdapter,
     UNet2DConditionModel,
     UniPCMultistepScheduler,
 )
 from src.data.instruct_pix2pix_dataset import ImageEditDataset, collate_fn
+from src.utils.边缘检测 import HEDDetector
 
 # from src.models.attention_processor.flood_aware_attn_processor import FloodAwareAttnProcessor2_0
 # from src.pipeline.instructP2P_T2I_Pipeline import InstructPix2PixT2IAdapterPipeline
@@ -360,6 +360,7 @@ def run_epoch(
     global_step: int,
     progress_bar: tqdm,
     ema_unet: EMAModel | None,
+    hed_model: torch.nn.Module | None = None,
 ) -> tuple[float, int]:
     """运行单个训练 epoch。
 
@@ -373,6 +374,9 @@ def run_epoch(
     # epoch 级统计（保存每个优化 step 的平均 loss 的和）
     total_optim_loss = 0.0
     optim_steps_in_epoch = 0
+
+    # HED 辅助损失统计（每个优化 step 内的 micro-step 平均）
+    hed_accum_sum = 0.0
 
     for step, batch in enumerate(train_dataloader):
         with accelerator.accumulate(unet):
@@ -438,6 +442,53 @@ def run_epoch(
 
                 loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 
+                # =============== HED 边缘损失 ===============
+                hed_cfg = train_cfg.get("loss", {}).get("hed", {}) if isinstance(train_cfg.get("loss"), dict) else {}
+                if hed_model is not None and hed_cfg.get("enabled", False):
+                    # 还原预测的去噪 latent -> 图像 [0,1]
+                    # 参考用户片段：使用 scheduler.step 的 pred_original_sample
+                    pred_original_sample = [
+                        noise_scheduler.step(n, t, nl).pred_original_sample.to(weight_dtype)
+                        for (n, t, nl) in zip(model_pred, timesteps, noisy_latents)
+                    ]
+                    pred_original_sample = torch.stack(pred_original_sample)
+                    pred_original_sample = (1 / vae.config.scaling_factor) * pred_original_sample
+                    pred_image = vae.decode(pred_original_sample.to(weight_dtype)).sample
+                    pred_image = (pred_image / 2 + 0.5).clamp(0, 1)
+
+                    gt_image = (batch["edited_pixel_values"] / 2 + 0.5).clamp(0, 1)
+
+                    # # 调试：可视化 pred_image，gt_image 到一张图中
+                    # import torchvision.utils as vutils
+
+                    # vutils.save_image(pred_image, "debug_pred_image.png")
+                    # vutils.save_image(gt_image, "debug_gt_image.png")
+
+                    # 边缘图：对预测边缘保留梯度，对 GT 边缘停止梯度。
+                    pred_edge = hed_model(pred_image)
+                    with torch.no_grad():
+                        gt_edge = hed_model(gt_image)
+
+                    # # 调式：边缘图可视化
+                    # import torchvision.utils as vutils
+
+                    # vutils.save_image(pred_edge, "debug_pred_edge.png")
+                    # vutils.save_image(gt_edge, "debug_gt_edge.png")
+
+                    # L1/L2 可选，默认 L1
+                    loss_type = hed_cfg.get("loss_type", "l1")  # l1 or l2
+                    if loss_type == "l2":
+                        hed_loss = F.mse_loss(pred_edge, gt_edge, reduction="mean")
+                    else:
+                        hed_loss = F.l1_loss(pred_edge, gt_edge, reduction="mean")
+
+                    hed_weight = float(hed_cfg.get("weight", 0.1))
+                    loss = loss + hed_weight * hed_loss
+
+                    # 分布式收集 hed 辅助损失（raw），用于该优化 step 的平均日志
+                    avg_hed = accelerator.gather(hed_loss.detach()).mean()
+                    hed_accum_sum += avg_hed.item()
+
             # 12. 分布式收集用于日志（保持与原实现一致）
             avg_loss = accelerator.gather(loss).mean()
             # 不在这里做除法，保持真实求和；最后一个不完整累计组只除以实际 micro_count
@@ -468,6 +519,8 @@ def run_epoch(
             total_optim_loss += step_loss
 
             logs = {"step_loss": step_loss}
+            if hed_model is not None:
+                logs["hed_loss"] = hed_accum_sum / micro_count
             if lr_scheduler is not None:
                 logs["lr"] = lr_scheduler.get_last_lr()[0]
             progress_bar.set_postfix(**logs)
@@ -476,6 +529,7 @@ def run_epoch(
             # 重置 micro 级累计
             accum_loss_sum = 0.0
             micro_count = 0
+            hed_accum_sum = 0.0
 
     epoch_avg_loss = (total_optim_loss / optim_steps_in_epoch) if optim_steps_in_epoch > 0 else float("nan")
     return epoch_avg_loss, global_step
@@ -642,6 +696,12 @@ def main():
 
     # Load scheduler, tokenizer and models.
     noise_scheduler, tokenizer, text_encoder, vae, unet = load_model(model_cfg, accelerator)
+    # HED 模型（可选）
+    if train_cfg["loss"]["hed"]["enabled"]:
+        accelerator.print("使用 HED 边缘检测")
+        hed_model = HEDDetector(train_cfg.get("loss", {}).get("hed")).to(accelerator.device)
+    else:
+        hed_model = None
 
     unet = init_instructpix2pix_unet(unet, accelerator)
 
@@ -750,6 +810,8 @@ def main():
     # Move text_encode and vae to gpu and cast to weight_dtype
     text_encoder.to(accelerator.device, dtype=weight_dtype)
     vae.to(accelerator.device, dtype=weight_dtype)
+    if hed_model is not None:
+        hed_model.to(accelerator.device, dtype=weight_dtype)
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / train_cfg.get("gradient_accumulation_steps"))
@@ -819,6 +881,7 @@ def main():
             global_step=global_step,
             progress_bar=progress_bar,
             ema_unet=ema_unet if model_cfg.get("use_ema") else None,
+            hed_model=hed_model,
         )
 
         # 当前 epoch 的进度条完成后关闭（避免多 epoch 时 tqdm 行数累积）
@@ -923,7 +986,7 @@ def main():
             requires_safety_checker=False,
             feature_extractor=None,
         )
-        pipeline.save_pretrained(output_dir)
+        # pipeline.save_pretrained(output_dir)
 
     accelerator.end_training()
 
